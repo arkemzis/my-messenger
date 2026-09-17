@@ -4,7 +4,32 @@ const session = require('express-session');
 const http = require('http');
 const { Server } = require('socket.io');
 const pool = require('./db');
-
+// Автоматическое создание таблиц при старте
+async function initDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        from_user INTEGER NOT NULL,
+        to_user INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log('✅ Таблицы готовы');
+  } catch (err) {
+    console.error('Ошибка создания таблиц:', err.message);
+  }
+}
+initDatabase();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
