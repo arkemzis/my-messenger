@@ -40,7 +40,7 @@ app.post('/register', async (req, res) => {
     );
     req.session.userId = result.rows[0].id;
     console.log('Новый пользователь:', email, 'id:', result.rows[0].id);
-    res.json({ ok: true, message: 'Регистрация успешна!' });
+    res.json({ ok: true, message: 'Регистрация успешна!', userId: result.rows[0].id });
   } catch (err) {
     console.error('Ошибка базы:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
@@ -62,7 +62,7 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ ok: false, message: 'Неверный email или пароль' });
     }
     req.session.userId = result.rows[0].id;
-    res.json({ ok: true, message: 'Вход выполнен!' });
+    res.json({ ok: true, message: 'Вход выполнен!', userId: result.rows[0].id });
   } catch (err) {
     console.error('Ошибка базы:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
@@ -95,15 +95,14 @@ app.get('/users', async (req, res) => {
 
 // Получить сообщения с пользователем
 app.get('/messages', async (req, res) => {
-  if (!req.session.userId) {
-    return res.status(401).json({ ok: false, message: 'Не вошёл' });
-  }
   const withUserId = parseInt(req.query.with);
-  if (!withUserId) {
-    return res.status(400).json({ ok: false, message: 'Не указан собеседник' });
+  const myId = parseInt(req.query.me) || req.session.userId;
+
+  if (!myId || !withUserId) {
+    return res.status(400).json({ ok: false, message: 'Не указан пользователь' });
   }
+
   try {
-    const myId = req.session.userId;
     const result = await pool.query(
       `SELECT id, from_user, to_user, text, created_at
        FROM messages
@@ -121,23 +120,22 @@ app.get('/messages', async (req, res) => {
 
 // Отправить сообщение
 app.post('/send', async (req, res) => {
-  if (!req.session.userId) {
-    return res.status(401).json({ ok: false, message: 'Не вошёл' });
-  }
-  const { to, text } = req.body;
+  const { to, text, from } = req.body;
+  const fromUserId = parseInt(from) || req.session.userId;
   const toUserId = parseInt(to);
-  if (!toUserId || !text || !text.trim()) {
-    return res.status(400).json({ ok: false, message: 'Пустое сообщение' });
+
+  if (!fromUserId || !toUserId || !text || !text.trim()) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
   }
+
   try {
     const result = await pool.query(
       'INSERT INTO messages (from_user, to_user, text) VALUES ($1, $2, $3) RETURNING id, created_at',
-      [req.session.userId, toUserId, text.trim()]
+      [fromUserId, toUserId, text.trim()]
     );
 
-    // Отправляем событие по WebSocket обоим участникам
     io.emit('message', {
-      from: req.session.userId,
+      from: fromUserId,
       to: toUserId,
       text: text.trim(),
       created_at: result.rows[0].created_at
