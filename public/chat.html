@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <title>Чат — Мой Мессенджер</title>
+  <title>Чат — Мой Мессенджер</title>  <script src="/socket.io/socket.io.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
     body {
@@ -97,8 +97,10 @@
     <input type="text" id="input" placeholder="Напишите сообщение..." autofocus>
     <button onclick="send()">Отправить</button>
   </div>
-
+  
   <script>
+    const socket = io();
+
     const params = new URLSearchParams(window.location.search);
     const withUserId = parseInt(params.get('with'));
     let myId = null;
@@ -115,6 +117,7 @@
       }
       const data = await r.json();
       myId = data.userId;
+      socket.emit('identify', myId);
     }
 
     async function loadTitle() {
@@ -129,26 +132,29 @@
       return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
     }
 
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function appendMessage(m) {
+      const box = document.getElementById('messages');
+      const div = document.createElement('div');
+      const isMe = m.from_user === myId || m.from === myId;
+      div.className = 'msg ' + (isMe ? 'me' : 'them');
+      div.innerHTML = `${escapeHtml(m.text)}<span class="time">${formatTime(m.created_at)}</span>`;
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    }
+
     async function loadMessages() {
       const r = await fetch('/messages?with=' + withUserId);
       const data = await r.json();
       if (!data.ok) return;
       const box = document.getElementById('messages');
       box.innerHTML = '';
-      data.messages.forEach(m => {
-        const div = document.createElement('div');
-        const isMe = m.from_user === myId;
-        div.className = 'msg ' + (isMe ? 'me' : 'them');
-        div.innerHTML = `${escapeHtml(m.text)}<span class="time">${formatTime(m.created_at)}</span>`;
-        box.appendChild(div);
-      });
-      box.scrollTop = box.scrollHeight;
-    }
-
-    function escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
+      data.messages.forEach(appendMessage);
     }
 
     async function send() {
@@ -161,8 +167,13 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ to: withUserId, text })
       });
-      await loadMessages();
     }
+
+    socket.on('message', (data) => {
+      if (data.from === withUserId || data.to === withUserId) {
+        appendMessage(data);
+      }
+    });
 
     document.getElementById('input').addEventListener('keydown', e => {
       if (e.key === 'Enter') send();
@@ -172,8 +183,9 @@
       await loadMe();
       await loadTitle();
       await loadMessages();
-      setInterval(loadMessages, 2000);
     })();
   </script>
 </body>
 </html>
+
+ 

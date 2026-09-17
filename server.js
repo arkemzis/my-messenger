@@ -1,7 +1,10 @@
 const express = require('express');
 const path = require('path');
 const session = require('express-session');
+const http = require('http');
+const { Server } = require('socket.io');
 const pool = require('./db');
+
 const app = express();
 const PORT = 3000;
 
@@ -90,7 +93,7 @@ app.get('/users', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {// Получить сообщения с пользователем
+// Получить сообщения с пользователем
 app.get('/messages', async (req, res) => {
   if (!req.session.userId) {
     return res.status(401).json({ ok: false, message: 'Не вошёл' });
@@ -131,6 +134,15 @@ app.post('/send', async (req, res) => {
       'INSERT INTO messages (from_user, to_user, text) VALUES ($1, $2, $3) RETURNING id, created_at',
       [req.session.userId, toUserId, text.trim()]
     );
+
+    // Отправляем событие по WebSocket обоим участникам
+    io.emit('message', {
+      from: req.session.userId,
+      to: toUserId,
+      text: text.trim(),
+      created_at: result.rows[0].created_at
+    });
+
     res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at });
   } catch (err) {
     console.error('Ошибка базы:', err.message);
@@ -138,5 +150,24 @@ app.post('/send', async (req, res) => {
   }
 });
 
+// HTTP-сервер + WebSocket
+const server = http.createServer(app);
+const io = new Server(server);
+
+io.on('connection', (socket) => {
+  console.log('WebSocket подключён:', socket.id);
+
+  socket.on('identify', (userId) => {
+    socket.userId = userId;
+    socket.join('user_' + userId);
+    console.log('Пользователь', userId, 'подключён к WebSocket');
+  });
+
+  socket.on('disconnect', () => {
+    console.log('WebSocket отключён:', socket.id);
+  });
+});
+
+server.listen(PORT, () => {
   console.log(`Сервер запущен: http://localhost:${PORT}`);
 });
