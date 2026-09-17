@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Чат — Мой Мессенджер</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
+    body {
+      background: #f0f2f5;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .header {
+      background: #2a5298;
+      color: white;
+      padding: 14px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .header a { color: white; text-decoration: none; font-size: 14px; }
+    .header .title { font-weight: bold; }
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .msg {
+      max-width: 65%;
+      padding: 10px 14px;
+      border-radius: 12px;
+      font-size: 15px;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+    }
+    .msg.me {
+      align-self: flex-end;
+      background: #2a5298;
+      color: white;
+      border-bottom-right-radius: 4px;
+    }
+    .msg.them {
+      align-self: flex-start;
+      background: white;
+      color: #222;
+      border-bottom-left-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .msg .time {
+      font-size: 11px;
+      opacity: 0.7;
+      margin-top: 4px;
+      display: block;
+    }
+    .input-bar {
+      display: flex;
+      padding: 12px;
+      background: white;
+      border-top: 1px solid #ddd;
+      gap: 8px;
+    }
+    .input-bar input {
+      flex: 1;
+      padding: 12px 14px;
+      border: 1px solid #ddd;
+      border-radius: 24px;
+      font-size: 15px;
+      outline: none;
+    }
+    .input-bar input:focus { border-color: #2a5298; }
+    .input-bar button {
+      padding: 0 24px;
+      background: #2a5298;
+      color: white;
+      border: none;
+      border-radius: 24px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    .input-bar button:hover { background: #1e3c72; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <a href="/users.html">← Назад</a>
+    <span class="title" id="title">Чат</span>
+    <span></span>
+  </div>
+
+  <div class="messages" id="messages"></div>
+
+  <div class="input-bar">
+    <input type="text" id="input" placeholder="Напишите сообщение..." autofocus>
+    <button onclick="send()">Отправить</button>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const withUserId = parseInt(params.get('with'));
+    let myId = null;
+
+    if (!withUserId) {
+      window.location.href = '/users.html';
+    }
+
+    async function loadMe() {
+      const r = await fetch('/me');
+      if (!r.ok) {
+        window.location.href = '/';
+        return;
+      }
+      const data = await r.json();
+      myId = data.userId;
+    }
+
+    async function loadTitle() {
+      const r = await fetch('/users');
+      const users = await r.json();
+      const other = users.find(u => u.id === withUserId);
+      document.getElementById('title').textContent = other ? other.email : 'Чат';
+    }
+
+    function formatTime(iso) {
+      const d = new Date(iso);
+      return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    }
+
+    async function loadMessages() {
+      const r = await fetch('/messages?with=' + withUserId);
+      const data = await r.json();
+      if (!data.ok) return;
+      const box = document.getElementById('messages');
+      box.innerHTML = '';
+      data.messages.forEach(m => {
+        const div = document.createElement('div');
+        const isMe = m.from_user === myId;
+        div.className = 'msg ' + (isMe ? 'me' : 'them');
+        div.innerHTML = `${escapeHtml(m.text)}<span class="time">${formatTime(m.created_at)}</span>`;
+        box.appendChild(div);
+      });
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    async function send() {
+      const input = document.getElementById('input');
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      await fetch('/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: withUserId, text })
+      });
+      await loadMessages();
+    }
+
+    document.getElementById('input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') send();
+    });
+
+    (async () => {
+      await loadMe();
+      await loadTitle();
+      await loadMessages();
+      setInterval(loadMessages, 2000);
+    })();
+  </script>
+</body>
+</html>

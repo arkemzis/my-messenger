@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Пользователи — Мой Мессенджер</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
+    body {
+      background: #f0f2f5;
+      padding: 20px;
+    }
+    .container {
+      max-width: 600px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+    }
+    h1 { color: #1e3c72; margin-bottom: 16px; }
+    .user {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid #eee;
+    }
+    .user:last-child { border-bottom: none; }
+    .user .email { color: #333; font-size: 15px; }
+    .user button {
+      padding: 8px 16px;
+      background: #2a5298;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .user button:hover { background: #1e3c72; }
+    .me { background: #eef3fb; font-weight: bold; }
+    .nav {
+      margin-bottom: 16px;
+      display: flex;
+      gap: 12px;
+    }
+    .nav a {
+      color: #2a5298;
+      text-decoration: none;
+      font-size: 14px;
+    }
+    .nav a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="nav">
+      <a href="/">← На главную</a>
+      <a href="#" onclick="logout(); return false;">Выйти</a>
+    </div>
+    <h1>Пользователи</h1>
+    <div id="users">Загрузка...</div>
+  </div>
+
+  <script>
+    let myId = null;
+
+    async function loadMe() {
+      const r = await fetch('/me');
+      if (r.ok) {
+        const data = await r.json();
+        myId = data.userId;
+      } else {
+        window.location.href = '/';
+      }
+    }
+
+    async function loadUsers() {
+      const r = await fetch('/users');
+      const users = await r.json();
+      const box = document.getElementById('users');
+      box.innerHTML = '';
+      users.forEach(u => {
+        const div = document.createElement('div');
+        div.className = 'user' + (u.id === myId ? ' me' : '');
+        div.innerHTML = `
+          <span class="email">${u.email}${u.id === myId ? ' (вы)' : ''}</span>
+          ${u.id !== myId ? `<button onclick="openChat(${u.id})">Написать</button>` : ''}
+        `;
+        box.appendChild(div);
+      });
+    }
+
+    function openChat(userId) {
+      window.location.href = '/chat.html?with=' + userId;
+    }
+
+    async function logout() {
+      await fetch('/logout', { method: 'POST' });
+      window.location.href = '/';
+    }
+
+    (async () => {
+      await loadMe();
+      await loadUsers();
+    })();
+  </script>
+</body>
+</html>
