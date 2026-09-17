@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Мой Мессенджер — Вход</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
+    body {
+      background: linear-gradient(135deg, #1e3c72, #2a5298);
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      background: white;
+      padding: 40px;
+      border-radius: 16px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+      width: 360px;
+      text-align: center;
+    }
+    h1 {
+      color: #1e3c72;
+      margin-bottom: 8px;
+      font-size: 26px;
+    }
+    p.subtitle {
+      color: #888;
+      margin-bottom: 24px;
+      font-size: 14px;
+    }
+    input {
+      width: 100%;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font-size: 15px;
+      outline: none;
+      transition: border 0.2s;
+    }
+    input:focus { border-color: #2a5298; }
+    button {
+      width: 100%;
+      padding: 12px;
+      background: #2a5298;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #1e3c72; }
+    .google-btn {
+      background: white;
+      color: #333;
+      border: 1px solid #ddd;
+      margin-top: 10px;
+    }
+    .google-btn:hover { background: #f5f5f5; }
+    .divider {
+      margin: 20px 0;
+      color: #aaa;
+      font-size: 12px;
+    }
+    .message {
+      margin-top: 16px;
+      font-size: 14px;
+      min-height: 20px;
+    }
+    .message.ok { color: #2a9d5c; }
+    .message.error { color: #d33; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Мой Мессенджер</h1>
+    <p class="subtitle">Войдите, чтобы продолжить</p>
+
+    <input type="email" id="email" placeholder="Email">
+    <input type="password" id="password" placeholder="Пароль">
+    <button onclick="sendData('/login')">Войти</button>
+    <button onclick="sendData('/register')" style="margin-top:8px;background:#2a9d5c;">Зарегистрироваться</button>
+
+    <div class="divider">— или —</div>
+
+    <button class="google-btn">Войти через Google</button>
+
+    <div class="message" id="message"></div>
+  </div>
+
+  <script>
+    async function sendData(url) {
+      const email = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value.trim();
+      const msg = document.getElementById('message');
+
+      if (!email || !password) {
+        msg.className = 'message error';
+        msg.textContent = 'Заполните оба поля';
+        return;
+      }
+
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+
+        const data = await response.json();
+
+        if (data.ok) {
+          msg.className = 'message ok';
+          msg.textContent = data.message;
+        } else {
+          msg.className = 'message error';
+          msg.textContent = data.message;
+        }
+      } catch (err) {
+        msg.className = 'message error';
+        msg.textContent = 'Ошибка соединения с сервером';
+      }
+    }
+  </script>
+</body>
+</html>
