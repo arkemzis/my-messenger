@@ -53,6 +53,13 @@ app.use(session({
 const server = http.createServer(app);
 const io = new Server(server);
 
+// Кто сейчас онлайн: { userId: [socketId1, socketId2, ...] }
+const onlineUsers = new Map();
+
+function getOnlineIds() {
+  return Array.from(onlineUsers.keys());
+}
+
 // Главная
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -104,7 +111,7 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// Установить имя пользователя
+// Установить имя
 app.post('/set-name', async (req, res) => {
   const { userId, name } = req.body;
   const uid = parseInt(userId) || req.session.userId;
@@ -134,17 +141,21 @@ app.get('/me', (req, res) => {
   res.json({ ok: true, userId: req.session.userId });
 });
 
-// Список всех пользователей
+// Список всех пользователей + кто онлайн
 app.get('/users', async (req, res) => {
   try {
     const result = await pool.query('SELECT id, email, name FROM users ORDER BY id');
-    res.json(result.rows);
+    const users = result.rows.map(u => ({
+      ...u,
+      online: onlineUsers.has(u.id)
+    }));
+    res.json(users);
   } catch (err) {
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
 
-// Получить сообщения с пользователем
+// Получить сообщения
 app.get('/messages', async (req, res) => {
   const withUserId = parseInt(req.query.with);
   const myId = parseInt(req.query.me) || req.session.userId;
@@ -243,17 +254,50 @@ io.on('connection', (socket) => {
   console.log('WebSocket подключён:', socket.id);
 
   socket.on('identify', (userId) => {
-    socket.userId = userId;
-    socket.join('user_' + userId);
-    console.log('Пользователь', userId, 'подключён к WebSocket');
+    const uid = parseInt(userId);
+    if (!uid) return;
+    socket.userId = uid;
+    socket.join('user_' + uid);
+
+    // Отмечаем как онлайн
+    if (!onlineUsers.has(uid)) {
+      onlineUsers.set(uid, []);
+    }
+    onlineUsers.get(uid).push(socket.id);
+
+    console.log('Пользователь', uid, 'подключён. Всего онлайн:', onlineUsers.size);
+
+    // Рассылаем всем "пользователь онлайн"
+    io.emit('user_online', { userId: uid });
+    // Отправляем новому — список всех, кто сейчас онлайн
+    socket.emit('online_list', getOnlineIds());
+  });
+
+  // "Печатает..."
+  socket.on('typing', (data) => {
+    if (!data || !data.to || !socket.userId) return;
+    io.to('user_' + data.to).emit('user_typing', {
+      from: socket.userId,
+      typing: !!data.typing,
+    });
   });
 
   socket.on('disconnect', () => {
+    const uid = socket.userId;
     console.log('WebSocket отключён:', socket.id);
+
+    if (uid && onlineUsers.has(uid)) {
+      const arr = onlineUsers.get(uid).filter(id => id !== socket.id);
+      if (arr.length === 0) {
+        onlineUsers.delete(uid);
+        io.emit('user_offline', { userId: uid });
+      } else {
+        onlineUsers.set(uid, arr);
+      }
+    }
   });
 });
 
-// Запуск
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Сервер запущен на порту ${PORT}`);
 });
