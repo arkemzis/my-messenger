@@ -1,7 +1,9 @@
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 const session = require('express-session');
 const http = require('http');
+const multer = require('multer');
 const { Server } = require('socket.io');
 const pool = require('./db');
 
@@ -24,9 +26,16 @@ async function initDatabase() {
         id SERIAL PRIMARY KEY,
         from_user INTEGER NOT NULL,
         to_user INTEGER NOT NULL,
-        text TEXT NOT NULL,
+        text TEXT NOT NULL DEFAULT '',
+        image_url TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       )
+    `);
+    await pool.query(`
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''
+    `);
+    await pool.query(`
+      ALTER TABLE messages ALTER COLUMN text SET DEFAULT ''
     `);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS reactions (
@@ -48,9 +57,30 @@ initDatabase();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Создаём папку для загрузок
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir);
+}
+
+// Multer — хранит файлы на диске
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || '.jpg';
+    const name = Date.now() + '_' + Math.round(Math.random() * 1e9) + ext;
+    cb(null, name);
+  },
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 МБ
+});
+
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(uploadsDir));
 app.use(session({
   secret: 'rocket-secret-key-2026',
   resave: false,
@@ -81,7 +111,6 @@ app.post('/register', async (req, res) => {
     req.session.userId = result.rows[0].id;
     res.json({ ok: true, message: 'Регистрация успешна!', userId: result.rows[0].id });
   } catch (err) {
-    console.error('Ошибка базы:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
@@ -98,7 +127,6 @@ app.post('/login', async (req, res) => {
     req.session.userId = result.rows[0].id;
     res.json({ ok: true, message: 'Вход выполнен!', userId: result.rows[0].id });
   } catch (err) {
-    console.error('Ошибка базы:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
@@ -135,7 +163,6 @@ app.get('/users', async (req, res) => {
   }
 });
 
-// Сообщения — теперь с реакциями
 app.get('/messages', async (req, res) => {
   const withUserId = parseInt(req.query.with);
   const myId = parseInt(req.query.me) || req.session.userId;
@@ -144,7 +171,7 @@ app.get('/messages', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT
-         m.id, m.from_user, m.to_user, m.text, m.created_at,
+         m.id, m.from_user, m.to_user, m.text, m.image_url, m.created_at,
          COALESCE(
            (SELECT json_agg(json_build_object('user_id', r.user_id, 'emoji', r.emoji))
             FROM reactions r WHERE r.message_id = m.id),
@@ -158,28 +185,39 @@ app.get('/messages', async (req, res) => {
     );
     res.json({ ok: true, messages: result.rows });
   } catch (err) {
-    console.error('Ошибка базы:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
 
+// Загрузка картинки
+app.post('/upload', upload.single('image'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, message: 'Файл не загружен' });
+  const imageUrl = '/uploads/' + req.file.filename;
+  res.json({ ok: true, imageUrl });
+});
+
 app.post('/send', async (req, res) => {
-  const { to, text, from } = req.body;
+  const { to, text, from, imageUrl } = req.body;
   const fromUserId = parseInt(from) || req.session.userId;
   const toUserId = parseInt(to);
-  if (!fromUserId || !toUserId || !text || !text.trim()) {
+  const textTrim = (text || '').trim();
+  const imgUrl = (imageUrl || '').trim();
+
+  if (!fromUserId || !toUserId || (!textTrim && !imgUrl)) {
     return res.status(400).json({ ok: false, message: 'Не хватает данных' });
   }
+
   try {
     const result = await pool.query(
-      'INSERT INTO messages (from_user, to_user, text) VALUES ($1, $2, $3) RETURNING id, created_at',
-      [fromUserId, toUserId, text.trim()]
+      'INSERT INTO messages (from_user, to_user, text, image_url) VALUES ($1, $2, $3, $4) RETURNING id, created_at',
+      [fromUserId, toUserId, textTrim, imgUrl]
     );
     io.emit('message', {
       id: result.rows[0].id,
       from: fromUserId,
       to: toUserId,
-      text: text.trim(),
+      text: textTrim,
+      image_url: imgUrl,
       created_at: result.rows[0].created_at,
       reactions: []
     });
@@ -194,9 +232,18 @@ app.delete('/messages/:id', async (req, res) => {
   const userId = parseInt(req.query.userId) || req.session.userId;
   if (!messageId || !userId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
   try {
-    const check = await pool.query('SELECT from_user, to_user FROM messages WHERE id = $1', [messageId]);
+    const check = await pool.query('SELECT from_user, to_user, image_url FROM messages WHERE id = $1', [messageId]);
     if (check.rows.length === 0) return res.status(404).json({ ok: false, message: 'Сообщение не найдено' });
-    if (check.rows[0].from_user !== userId) return res.status(403).json({ ok: false, message: 'Можно удалять только свои сообщения' });
+    if (check.rows[0].from_user !== userId) return res.status(403).json({ ok: false, message: 'Можно удалять только свои' });
+
+    // Удаляем картинку с диска
+    const imgUrl = check.rows[0].image_url;
+    if (imgUrl && imgUrl.startsWith('/uploads/')) {
+      const filename = imgUrl.replace('/uploads/', '');
+      const fullPath = path.join(uploadsDir, filename);
+      fs.unlink(fullPath, () => {});
+    }
+
     await pool.query('DELETE FROM reactions WHERE message_id = $1', [messageId]);
     await pool.query('DELETE FROM messages WHERE id = $1', [messageId]);
     io.emit('message_deleted', {
@@ -210,7 +257,6 @@ app.delete('/messages/:id', async (req, res) => {
   }
 });
 
-// Реакция на сообщение (toggle)
 app.post('/react', async (req, res) => {
   const { messageId, userId, emoji } = req.body;
   const uid = parseInt(userId) || req.session.userId;
@@ -235,23 +281,19 @@ app.post('/react', async (req, res) => {
       action = 'added';
     }
 
-    // Узнаём отправителя и получателя сообщения — чтобы разослать обоим
     const msg = await pool.query('SELECT from_user, to_user FROM messages WHERE id = $1', [mid]);
     if (msg.rows.length > 0) {
-      const payload = {
+      io.emit('reaction_update', {
         messageId: mid,
         userId: uid,
         emoji,
         action,
         from: msg.rows[0].from_user,
         to: msg.rows[0].to_user
-      };
-      io.emit('reaction_update', payload);
+      });
     }
-
     res.json({ ok: true, action });
   } catch (err) {
-    console.error('Ошибка базы:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
