@@ -35,7 +35,8 @@ async function initDatabase() {
     `);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_id INTEGER`);
-        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited BOOLEAN DEFAULT FALSE`);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited BOOLEAN DEFAULT FALSE`);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER`);
     await pool.query(`ALTER TABLE messages ALTER COLUMN text SET DEFAULT ''`);
     await pool.query(`ALTER TABLE messages ALTER COLUMN to_user DROP NOT NULL`);
 
@@ -227,7 +228,6 @@ app.get('/users', async (req, res) => {
   }
 });
 
-// Сохранить публичный ключ пользователя
 app.post('/set-public-key', async (req, res) => {
   const { userId, publicKey } = req.body;
   const uid = parseInt(userId) || req.session.userId;
@@ -247,7 +247,6 @@ app.post('/set-public-key', async (req, res) => {
   }
 });
 
-// Получить публичный ключ пользователя
 app.get('/public-key/:userId', async (req, res) => {
   const uid = parseInt(req.params.userId);
   if (!uid) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
@@ -264,7 +263,6 @@ app.get('/public-key/:userId', async (req, res) => {
 
 // ============ ГРУППЫ И КАНАЛЫ ============
 
-// Создать группу или канал
 app.post('/create-group', async (req, res) => {
   const { userId, name, memberIds, isChannel } = req.body;
   const uid = parseInt(userId) || req.session.userId;
@@ -280,7 +278,6 @@ app.post('/create-group', async (req, res) => {
 
     await pool.query('INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [chatId, uid]);
 
-    // В канал НЕ добавляем участников сразу — они подписываются сами
     if (!isCh && Array.isArray(memberIds)) {
       for (const mid of memberIds) {
         const m = parseInt(mid);
@@ -297,7 +294,6 @@ app.post('/create-group', async (req, res) => {
   }
 });
 
-// Мои группы и каналы
 app.get('/my-chats', async (req, res) => {
   const uid = parseInt(req.query.userId) || req.session.userId;
   if (!uid) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
@@ -318,7 +314,6 @@ app.get('/my-chats', async (req, res) => {
   }
 });
 
-// Все публичные каналы (для поиска)
 app.get('/all-channels', async (req, res) => {
   try {
     const result = await pool.query(
@@ -334,7 +329,6 @@ app.get('/all-channels', async (req, res) => {
   }
 });
 
-// Информация о чате (для определения админа)
 app.get('/chat-info/:chatId', async (req, res) => {
   const chatId = parseInt(req.params.chatId);
   if (!chatId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
@@ -350,7 +344,6 @@ app.get('/chat-info/:chatId', async (req, res) => {
   }
 });
 
-// Участники
 app.get('/chat-members/:chatId', async (req, res) => {
   const chatId = parseInt(req.params.chatId);
   if (!chatId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
@@ -370,7 +363,6 @@ app.get('/chat-members/:chatId', async (req, res) => {
   }
 });
 
-// Подписаться на канал
 app.post('/join-channel', async (req, res) => {
   const { chatId, userId } = req.body;
   const cid = parseInt(chatId);
@@ -388,7 +380,6 @@ app.post('/join-channel', async (req, res) => {
   }
 });
 
-// Добавить участника (только для групп)
 app.post('/add-member', async (req, res) => {
   const { chatId, userId } = req.body;
   const cid = parseInt(chatId);
@@ -428,7 +419,10 @@ app.get('/messages', async (req, res) => {
       result = await pool.query(
         `SELECT
            m.id, m.from_user, m.to_user, m.chat_id, m.text, m.image_url, m.created_at,
+           m.edited, m.reply_to_id,
            u.name AS sender_name, u.email AS sender_email, u.avatar_url AS sender_avatar,
+           rm.text AS reply_text, rm.image_url AS reply_image_url, rm.from_user AS reply_from_user,
+           ru.name AS reply_sender_name, ru.email AS reply_sender_email,
            COALESCE(
              (SELECT json_agg(json_build_object('user_id', r.user_id, 'emoji', r.emoji))
               FROM reactions r WHERE r.message_id = m.id),
@@ -436,6 +430,8 @@ app.get('/messages', async (req, res) => {
            ) AS reactions
          FROM messages m
          LEFT JOIN users u ON u.id = m.from_user
+         LEFT JOIN messages rm ON rm.id = m.reply_to_id
+         LEFT JOIN users ru ON ru.id = rm.from_user
          WHERE m.chat_id = $1
          ORDER BY m.id ASC`,
         [chatId]
@@ -444,12 +440,17 @@ app.get('/messages', async (req, res) => {
       result = await pool.query(
         `SELECT
            m.id, m.from_user, m.to_user, m.chat_id, m.text, m.image_url, m.created_at,
+           m.edited, m.reply_to_id,
+           rm.text AS reply_text, rm.image_url AS reply_image_url, rm.from_user AS reply_from_user,
+           ru.name AS reply_sender_name, ru.email AS reply_sender_email,
            COALESCE(
              (SELECT json_agg(json_build_object('user_id', r.user_id, 'emoji', r.emoji))
               FROM reactions r WHERE r.message_id = m.id),
              '[]'::json
            ) AS reactions
          FROM messages m
+         LEFT JOIN messages rm ON rm.id = m.reply_to_id
+         LEFT JOIN users ru ON ru.id = rm.from_user
          WHERE m.chat_id IS NULL
            AND ((m.from_user = $1 AND m.to_user = $2)
              OR (m.from_user = $2 AND m.to_user = $1))
@@ -473,11 +474,37 @@ app.post('/upload', upload.single('image'), async (req, res) => {
   res.json({ ok: true, imageUrl });
 });
 
+// Вспомогательная функция: получить инфо об оригинале (для цитаты)
+async function getReplyInfo(replyId) {
+  if (!replyId) return {};
+  try {
+    const r = await pool.query(
+      `SELECT m.text, m.image_url, m.from_user, u.name, u.email
+       FROM messages m
+       LEFT JOIN users u ON u.id = m.from_user
+       WHERE m.id = $1`,
+      [replyId]
+    );
+    if (r.rows.length === 0) return { reply_to_id: null };
+    return {
+      reply_to_id: replyId,
+      reply_text: r.rows[0].text,
+      reply_image_url: r.rows[0].image_url,
+      reply_from_user: r.rows[0].from_user,
+      reply_sender_name: r.rows[0].name || r.rows[0].email,
+      reply_sender_email: r.rows[0].email,
+    };
+  } catch (e) {
+    return {};
+  }
+}
+
 app.post('/send', async (req, res) => {
-  const { to, text, from, imageUrl, chatId } = req.body;
+  const { to, text, from, imageUrl, chatId, replyToId } = req.body;
   const fromUserId = parseInt(from) || req.session.userId;
   const toUserId = parseInt(to);
   const cid = parseInt(chatId);
+  const replyId = parseInt(replyToId) || null;
   const textTrim = (text || '').trim();
   const imgUrl = (imageUrl || '').trim();
 
@@ -495,18 +522,19 @@ app.post('/send', async (req, res) => {
       const isChannel = chatInfo.rows[0].is_channel;
       const adminId = chatInfo.rows[0].created_by;
 
-      // В канале — только админ может писать
       if (isChannel && fromUserId !== adminId) {
         return res.status(403).json({ ok: false, message: 'Только админ может писать в канал' });
       }
 
       const result = await pool.query(
-        'INSERT INTO messages (from_user, chat_id, text, image_url) VALUES ($1, $2, $3, $4) RETURNING id, created_at',
-        [fromUserId, cid, textTrim, imgUrl]
+        'INSERT INTO messages (from_user, chat_id, text, image_url, reply_to_id) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at',
+        [fromUserId, cid, textTrim, imgUrl, replyId]
       );
 
       const userRes = await pool.query('SELECT name, email, avatar_url FROM users WHERE id = $1', [fromUserId]);
       const sender = userRes.rows[0] || {};
+
+      const replyInfo = await getReplyInfo(replyId);
 
       const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [cid]);
       for (const row of membersRes.rows) {
@@ -517,14 +545,16 @@ app.post('/send', async (req, res) => {
           text: textTrim,
           image_url: imgUrl,
           created_at: result.rows[0].created_at,
+          edited: false,
           sender_name: sender.name || sender.email,
           sender_email: sender.email,
           sender_avatar: sender.avatar_url || '',
-          reactions: []
+          reactions: [],
+          ...replyInfo,
         });
       }
 
-      return res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at });
+      return res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at, ...replyInfo });
     } catch (err) {
       console.error('Ошибка базы:', err.message);
       return res.status(500).json({ ok: false, message: 'Ошибка сервера' });
@@ -536,9 +566,12 @@ app.post('/send', async (req, res) => {
 
   try {
     const result = await pool.query(
-      'INSERT INTO messages (from_user, to_user, text, image_url) VALUES ($1, $2, $3, $4) RETURNING id, created_at',
-      [fromUserId, toUserId, textTrim, imgUrl]
+      'INSERT INTO messages (from_user, to_user, text, image_url, reply_to_id) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at',
+      [fromUserId, toUserId, textTrim, imgUrl, replyId]
     );
+
+    const replyInfo = await getReplyInfo(replyId);
+
     io.emit('message', {
       id: result.rows[0].id,
       from: fromUserId,
@@ -547,13 +580,16 @@ app.post('/send', async (req, res) => {
       text: textTrim,
       image_url: imgUrl,
       created_at: result.rows[0].created_at,
-      reactions: []
+      edited: false,
+      reactions: [],
+      ...replyInfo,
     });
-    res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at });
+    res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at, ...replyInfo });
   } catch (err) {
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
+
 // Редактировать сообщение
 app.post('/edit-message', async (req, res) => {
   const { messageId, userId, newText } = req.body;
@@ -580,10 +616,9 @@ app.post('/edit-message', async (req, res) => {
       [newText.trim(), mid]
     );
 
-    // Оповещаем
     const chatId = check.rows[0].chat_id;
     const toUser = check.rows[0].to_user;
-    const payload = { id: mid, newText: newText.trim(), from: uid };
+    const payload = { id: mid, newText: newText.trim(), from: uid, edited: true };
 
     if (chatId) {
       const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [chatId]);
