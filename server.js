@@ -78,7 +78,13 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
-
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public_keys (
+        user_id INTEGER PRIMARY KEY,
+        public_key TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
     console.log('✅ Таблицы готовы');
   } catch (err) {
     console.error('Ошибка создания таблиц:', err.message);
@@ -207,9 +213,49 @@ app.get('/me', (req, res) => {
 
 app.get('/users', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, email, name, avatar_url FROM users ORDER BY id');
+    const result = await pool.query(`
+      SELECT u.id, u.email, u.name, u.avatar_url, pk.public_key
+      FROM users u
+      LEFT JOIN public_keys pk ON pk.user_id = u.id
+      ORDER BY u.id
+    `);
     const users = result.rows.map(u => ({ ...u, online: onlineUsers.has(u.id) }));
     res.json(users);
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Сохранить публичный ключ пользователя
+app.post('/set-public-key', async (req, res) => {
+  const { userId, publicKey } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  if (!uid || !publicKey) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO public_keys (user_id, public_key) VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET public_key = $2`,
+      [uid, publicKey]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Ошибка базы:', err.message);
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Получить публичный ключ пользователя
+app.get('/public-key/:userId', async (req, res) => {
+  const uid = parseInt(req.params.userId);
+  if (!uid) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  try {
+    const result = await pool.query('SELECT public_key FROM public_keys WHERE user_id = $1', [uid]);
+    if (result.rows.length === 0) {
+      return res.json({ ok: true, publicKey: null });
+    }
+    res.json({ ok: true, publicKey: result.rows[0].public_key });
   } catch (err) {
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
