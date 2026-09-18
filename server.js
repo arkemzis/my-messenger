@@ -43,12 +43,40 @@ async function initDatabase() {
         UNIQUE(message_id, user_id, emoji)
       )
     `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS stories (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        image_url TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
     console.log('✅ Таблицы готовы');
   } catch (err) {
     console.error('Ошибка создания таблиц:', err.message);
   }
 }
 initDatabase();
+
+// Автоудаление старых сторис (старше 24 часов)
+async function cleanupOldStories() {
+  try {
+    const result = await pool.query(
+      "SELECT image_url FROM stories WHERE created_at < NOW() - INTERVAL '24 hours'"
+    );
+    for (const row of result.rows) {
+      if (row.image_url && row.image_url.startsWith('/uploads/')) {
+        const filename = row.image_url.replace('/uploads/', '');
+        const fullPath = path.join(__dirname, 'uploads', filename);
+        fs.unlink(fullPath, () => {});
+      }
+    }
+    await pool.query("DELETE FROM stories WHERE created_at < NOW() - INTERVAL '24 hours'");
+  } catch (err) {
+    console.error('Ошибка очистки сторис:', err.message);
+  }
+}
+setInterval(cleanupOldStories, 60 * 60 * 1000); // каждый час
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -131,7 +159,6 @@ app.post('/set-name', async (req, res) => {
   }
 });
 
-// Сохранить аватарку
 app.post('/set-avatar', async (req, res) => {
   const { userId, avatarUrl } = req.body;
   const uid = parseInt(userId) || req.session.userId;
@@ -196,6 +223,71 @@ app.post('/upload', upload.single('image'), async (req, res) => {
   res.json({ ok: true, imageUrl });
 });
 
+// ============= СТОРИС =============
+
+// Получить все активные сторис (сгруппированные по пользователю)
+app.get('/stories', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT s.id, s.user_id, s.image_url, s.created_at,
+             u.name, u.email, u.avatar_url
+      FROM stories s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.created_at > NOW() - INTERVAL '24 hours'
+      ORDER BY s.created_at ASC
+    `);
+    res.json({ ok: true, stories: result.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Добавить сторис
+app.post('/add-story', async (req, res) => {
+  const { userId, imageUrl } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  if (!uid || !imageUrl) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  try {
+    const result = await pool.query(
+      'INSERT INTO stories (user_id, image_url) VALUES ($1, $2) RETURNING id, created_at',
+      [uid, imageUrl]
+    );
+    io.emit('story_added', {
+      id: result.rows[0].id,
+      user_id: uid,
+      image_url: imageUrl,
+      created_at: result.rows[0].created_at
+    });
+    res.json({ ok: true, id: result.rows[0].id });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Удалить свою сторис
+app.delete('/stories/:id', async (req, res) => {
+  const storyId = parseInt(req.params.id);
+  const userId = parseInt(req.query.userId) || req.session.userId;
+  if (!storyId || !userId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  try {
+    const check = await pool.query('SELECT user_id, image_url FROM stories WHERE id = $1', [storyId]);
+    if (check.rows.length === 0) return res.status(404).json({ ok: false, message: 'Не найдено' });
+    if (check.rows[0].user_id !== userId) return res.status(403).json({ ok: false, message: 'Не твоя сторис' });
+
+    const imgUrl = check.rows[0].image_url;
+    if (imgUrl && imgUrl.startsWith('/uploads/')) {
+      const filename = imgUrl.replace('/uploads/', '');
+      fs.unlink(path.join(uploadsDir, filename), () => {});
+    }
+
+    await pool.query('DELETE FROM stories WHERE id = $1', [storyId]);
+    io.emit('story_deleted', { id: storyId, user_id: userId });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
 app.post('/send', async (req, res) => {
   const { to, text, from, imageUrl } = req.body;
   const fromUserId = parseInt(from) || req.session.userId;
@@ -239,8 +331,7 @@ app.delete('/messages/:id', async (req, res) => {
     const imgUrl = check.rows[0].image_url;
     if (imgUrl && imgUrl.startsWith('/uploads/')) {
       const filename = imgUrl.replace('/uploads/', '');
-      const fullPath = path.join(uploadsDir, filename);
-      fs.unlink(fullPath, () => {});
+      fs.unlink(path.join(uploadsDir, filename), () => {});
     }
 
     await pool.query('DELETE FROM reactions WHERE message_id = $1', [messageId]);
