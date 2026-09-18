@@ -37,6 +37,7 @@ async function initDatabase() {
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_id INTEGER`);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited BOOLEAN DEFAULT FALSE`);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER`);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP`);
     await pool.query(`ALTER TABLE messages ALTER COLUMN text SET DEFAULT ''`);
     await pool.query(`ALTER TABLE messages ALTER COLUMN to_user DROP NOT NULL`);
 
@@ -419,7 +420,7 @@ app.get('/messages', async (req, res) => {
       result = await pool.query(
         `SELECT
            m.id, m.from_user, m.to_user, m.chat_id, m.text, m.image_url, m.created_at,
-           m.edited, m.reply_to_id,
+           m.edited, m.reply_to_id, m.read_at,
            u.name AS sender_name, u.email AS sender_email, u.avatar_url AS sender_avatar,
            rm.text AS reply_text, rm.image_url AS reply_image_url, rm.from_user AS reply_from_user,
            ru.name AS reply_sender_name, ru.email AS reply_sender_email,
@@ -440,7 +441,7 @@ app.get('/messages', async (req, res) => {
       result = await pool.query(
         `SELECT
            m.id, m.from_user, m.to_user, m.chat_id, m.text, m.image_url, m.created_at,
-           m.edited, m.reply_to_id,
+           m.edited, m.reply_to_id, m.read_at,
            rm.text AS reply_text, rm.image_url AS reply_image_url, rm.from_user AS reply_from_user,
            ru.name AS reply_sender_name, ru.email AS reply_sender_email,
            COALESCE(
@@ -546,6 +547,7 @@ app.post('/send', async (req, res) => {
           image_url: imgUrl,
           created_at: result.rows[0].created_at,
           edited: false,
+          read_at: null,
           sender_name: sender.name || sender.email,
           sender_email: sender.email,
           sender_avatar: sender.avatar_url || '',
@@ -554,7 +556,7 @@ app.post('/send', async (req, res) => {
         });
       }
 
-      return res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at, ...replyInfo });
+      return res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at, read_at: null, ...replyInfo });
     } catch (err) {
       console.error('Ошибка базы:', err.message);
       return res.status(500).json({ ok: false, message: 'Ошибка сервера' });
@@ -581,11 +583,52 @@ app.post('/send', async (req, res) => {
       image_url: imgUrl,
       created_at: result.rows[0].created_at,
       edited: false,
+      read_at: null,
       reactions: [],
       ...replyInfo,
     });
-    res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at, ...replyInfo });
+    res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at, read_at: null, ...replyInfo });
   } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Пометить сообщения прочитанными
+app.post('/mark-read', async (req, res) => {
+  const { userId, withUserId, chatId } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  const peerId = parseInt(withUserId);
+  const cid = parseInt(chatId);
+
+  if (!uid || (!peerId && !cid)) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+
+  try {
+    if (cid) {
+      await pool.query(
+        `UPDATE messages SET read_at = NOW()
+         WHERE chat_id = $1 AND from_user != $2 AND read_at IS NULL`,
+        [cid, uid]
+      );
+
+      const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [cid]);
+      for (const row of membersRes.rows) {
+        io.to('user_' + row.user_id).emit('messages_read', { chatId: cid, by: uid });
+      }
+    } else if (peerId) {
+      await pool.query(
+        `UPDATE messages SET read_at = NOW()
+         WHERE chat_id IS NULL AND from_user = $1 AND to_user = $2 AND read_at IS NULL`,
+        [peerId, uid]
+      );
+
+      io.to('user_' + peerId).emit('messages_read', { withUserId: uid, by: uid });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('mark-read error:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
