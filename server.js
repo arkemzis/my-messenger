@@ -215,13 +215,19 @@ app.get('/me', (req, res) => {
 });
 
 app.get('/users', async (req, res) => {
+  const myId = parseInt(req.query.me) || req.session.userId || 0;
   try {
     const result = await pool.query(`
-      SELECT u.id, u.email, u.name, u.avatar_url, pk.public_key
+      SELECT u.id, u.email, u.name, u.avatar_url, pk.public_key,
+             (SELECT COUNT(*) FROM messages m
+              WHERE m.chat_id IS NULL
+                AND m.from_user = u.id
+                AND m.to_user = $1
+                AND m.read_at IS NULL) AS unread_count
       FROM users u
       LEFT JOIN public_keys pk ON pk.user_id = u.id
       ORDER BY u.id
-    `);
+    `, [myId]);
     const users = result.rows.map(u => ({ ...u, online: onlineUsers.has(u.id) }));
     res.json(users);
   } catch (err) {
@@ -302,7 +308,11 @@ app.get('/my-chats', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT c.id, c.name, c.created_by, c.is_channel, c.created_at,
-              (SELECT COUNT(*) FROM chat_members cm2 WHERE cm2.chat_id = c.id) AS members_count
+              (SELECT COUNT(*) FROM chat_members cm2 WHERE cm2.chat_id = c.id) AS members_count,
+              (SELECT COUNT(*) FROM messages m
+               WHERE m.chat_id = c.id
+                 AND m.from_user != $1
+                 AND m.read_at IS NULL) AS unread_count
        FROM chats c
        JOIN chat_members cm ON cm.chat_id = c.id
        WHERE cm.user_id = $1
