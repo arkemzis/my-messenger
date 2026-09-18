@@ -15,12 +15,12 @@ async function initDatabase() {
         email VARCHAR(255) UNIQUE NOT NULL,
         password VARCHAR(255) NOT NULL,
         name VARCHAR(100) DEFAULT '',
+        avatar_url TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
-    await pool.query(`
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(100) DEFAULT ''
-    `);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(100) DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -31,12 +31,8 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
-    await pool.query(`
-      ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''
-    `);
-    await pool.query(`
-      ALTER TABLE messages ALTER COLUMN text SET DEFAULT ''
-    `);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE messages ALTER COLUMN text SET DEFAULT ''`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS reactions (
         id SERIAL PRIMARY KEY,
@@ -57,25 +53,17 @@ initDatabase();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Создаём папку для загрузок
 const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir);
-}
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
 
-// Multer — хранит файлы на диске
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname) || '.jpg';
-    const name = Date.now() + '_' + Math.round(Math.random() * 1e9) + ext;
-    cb(null, name);
+    cb(null, Date.now() + '_' + Math.round(Math.random() * 1e9) + ext);
   },
 });
-const upload = multer({
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 МБ
-});
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
@@ -143,6 +131,19 @@ app.post('/set-name', async (req, res) => {
   }
 });
 
+// Сохранить аватарку
+app.post('/set-avatar', async (req, res) => {
+  const { userId, avatarUrl } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  if (!uid || !avatarUrl) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  try {
+    await pool.query('UPDATE users SET avatar_url = $1 WHERE id = $2', [avatarUrl, uid]);
+    res.json({ ok: true, message: 'Аватарка сохранена' });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
 app.post('/logout', (req, res) => {
   req.session.destroy();
   res.json({ ok: true, message: 'Вы вышли' });
@@ -155,7 +156,7 @@ app.get('/me', (req, res) => {
 
 app.get('/users', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, email, name FROM users ORDER BY id');
+    const result = await pool.query('SELECT id, email, name, avatar_url FROM users ORDER BY id');
     const users = result.rows.map(u => ({ ...u, online: onlineUsers.has(u.id) }));
     res.json(users);
   } catch (err) {
@@ -189,7 +190,6 @@ app.get('/messages', async (req, res) => {
   }
 });
 
-// Загрузка картинки
 app.post('/upload', upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ ok: false, message: 'Файл не загружен' });
   const imageUrl = '/uploads/' + req.file.filename;
@@ -236,7 +236,6 @@ app.delete('/messages/:id', async (req, res) => {
     if (check.rows.length === 0) return res.status(404).json({ ok: false, message: 'Сообщение не найдено' });
     if (check.rows[0].from_user !== userId) return res.status(403).json({ ok: false, message: 'Можно удалять только свои' });
 
-    // Удаляем картинку с диска
     const imgUrl = check.rows[0].image_url;
     if (imgUrl && imgUrl.startsWith('/uploads/')) {
       const filename = imgUrl.replace('/uploads/', '');
