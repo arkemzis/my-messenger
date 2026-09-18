@@ -13,8 +13,12 @@ async function initDatabase() {
         id SERIAL PRIMARY KEY,
         email VARCHAR(255) UNIQUE NOT NULL,
         password VARCHAR(255) NOT NULL,
+        name VARCHAR(100) DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       )
+    `);
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(100) DEFAULT ''
     `);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
@@ -100,6 +104,22 @@ app.post('/login', async (req, res) => {
   }
 });
 
+// Установить имя пользователя
+app.post('/set-name', async (req, res) => {
+  const { userId, name } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  if (!uid || !name || !name.trim()) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+  try {
+    await pool.query('UPDATE users SET name = $1 WHERE id = $2', [name.trim(), uid]);
+    res.json({ ok: true, message: 'Имя сохранено' });
+  } catch (err) {
+    console.error('Ошибка базы:', err.message);
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
 // Выход
 app.post('/logout', (req, res) => {
   req.session.destroy();
@@ -117,7 +137,7 @@ app.get('/me', (req, res) => {
 // Список всех пользователей
 app.get('/users', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, email FROM users ORDER BY id');
+    const result = await pool.query('SELECT id, email, name FROM users ORDER BY id');
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
