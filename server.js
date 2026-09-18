@@ -21,18 +21,42 @@ async function initDatabase() {
     `);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(100) DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''`);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
         from_user INTEGER NOT NULL,
-        to_user INTEGER NOT NULL,
+        to_user INTEGER,
+        chat_id INTEGER,
         text TEXT NOT NULL DEFAULT '',
         image_url TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_id INTEGER`);
     await pool.query(`ALTER TABLE messages ALTER COLUMN text SET DEFAULT ''`);
+    await pool.query(`ALTER TABLE messages ALTER COLUMN to_user DROP NOT NULL`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chats (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        created_by INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chat_members (
+        id SERIAL PRIMARY KEY,
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        joined_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(chat_id, user_id)
+      )
+    `);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS reactions (
         id SERIAL PRIMARY KEY,
@@ -43,6 +67,7 @@ async function initDatabase() {
         UNIQUE(message_id, user_id, emoji)
       )
     `);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS stories (
         id SERIAL PRIMARY KEY,
@@ -51,6 +76,7 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
+
     console.log('✅ Таблицы готовы');
   } catch (err) {
     console.error('Ошибка создания таблиц:', err.message);
@@ -58,7 +84,6 @@ async function initDatabase() {
 }
 initDatabase();
 
-// Автоудаление старых сторис (старше 24 часов)
 async function cleanupOldStories() {
   try {
     const result = await pool.query(
@@ -67,16 +92,13 @@ async function cleanupOldStories() {
     for (const row of result.rows) {
       if (row.image_url && row.image_url.startsWith('/uploads/')) {
         const filename = row.image_url.replace('/uploads/', '');
-        const fullPath = path.join(__dirname, 'uploads', filename);
-        fs.unlink(fullPath, () => {});
+        fs.unlink(path.join(__dirname, 'uploads', filename), () => {});
       }
     }
     await pool.query("DELETE FROM stories WHERE created_at < NOW() - INTERVAL '24 hours'");
-  } catch (err) {
-    console.error('Ошибка очистки сторис:', err.message);
-  }
+  } catch (err) {}
 }
-setInterval(cleanupOldStories, 60 * 60 * 1000); // каждый час
+setInterval(cleanupOldStories, 60 * 60 * 1000);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -191,28 +213,155 @@ app.get('/users', async (req, res) => {
   }
 });
 
-app.get('/messages', async (req, res) => {
-  const withUserId = parseInt(req.query.with);
-  const myId = parseInt(req.query.me) || req.session.userId;
-  if (!myId || !withUserId) return res.status(400).json({ ok: false, message: 'Не указан пользователь' });
+// ============ ГРУППЫ ============
+
+// Создать группу
+app.post('/create-group', async (req, res) => {
+  const { userId, name, memberIds } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  if (!uid || !name || !name.trim()) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+
+  try {
+    const chatResult = await pool.query(
+      'INSERT INTO chats (name, created_by) VALUES ($1, $2) RETURNING id, name, created_at',
+      [name.trim(), uid]
+    );
+    const chatId = chatResult.rows[0].id;
+
+    // Добавляем создателя
+    await pool.query('INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [chatId, uid]);
+
+    // Добавляем участников
+    if (Array.isArray(memberIds)) {
+      for (const mid of memberIds) {
+        const m = parseInt(mid);
+        if (m && m !== uid) {
+          await pool.query('INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [chatId, m]);
+        }
+      }
+    }
+
+    res.json({ ok: true, chatId, name: chatResult.rows[0].name });
+  } catch (err) {
+    console.error('Ошибка создания группы:', err.message);
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Мои группы
+app.get('/my-chats', async (req, res) => {
+  const uid = parseInt(req.query.userId) || req.session.userId;
+  if (!uid) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
 
   try {
     const result = await pool.query(
-      `SELECT
-         m.id, m.from_user, m.to_user, m.text, m.image_url, m.created_at,
-         COALESCE(
-           (SELECT json_agg(json_build_object('user_id', r.user_id, 'emoji', r.emoji))
-            FROM reactions r WHERE r.message_id = m.id),
-           '[]'::json
-         ) AS reactions
-       FROM messages m
-       WHERE (m.from_user = $1 AND m.to_user = $2)
-          OR (m.from_user = $2 AND m.to_user = $1)
-       ORDER BY m.id ASC`,
-      [myId, withUserId]
+      `SELECT c.id, c.name, c.created_by, c.created_at,
+              (SELECT COUNT(*) FROM chat_members cm2 WHERE cm2.chat_id = c.id) AS members_count
+       FROM chats c
+       JOIN chat_members cm ON cm.chat_id = c.id
+       WHERE cm.user_id = $1
+       ORDER BY c.created_at DESC`,
+      [uid]
     );
+    res.json({ ok: true, chats: result.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Участники группы
+app.get('/chat-members/:chatId', async (req, res) => {
+  const chatId = parseInt(req.params.chatId);
+  if (!chatId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.email, u.name, u.avatar_url
+       FROM users u
+       JOIN chat_members cm ON cm.user_id = u.id
+       WHERE cm.chat_id = $1
+       ORDER BY cm.joined_at ASC`,
+      [chatId]
+    );
+    res.json({ ok: true, members: result.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Добавить участника
+app.post('/add-member', async (req, res) => {
+  const { chatId, userId } = req.body;
+  const cid = parseInt(chatId);
+  const uid = parseInt(userId);
+  if (!cid || !uid) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+
+  try {
+    await pool.query(
+      'INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [cid, uid]
+    );
+    io.emit('chat_member_added', { chatId: cid, userId: uid });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// ============ СООБЩЕНИЯ ============
+
+// Получить сообщения — работает и для личных, и для групп
+app.get('/messages', async (req, res) => {
+  const myId = parseInt(req.query.me) || req.session.userId;
+  const withUserId = parseInt(req.query.with);
+  const chatId = parseInt(req.query.chatId);
+
+  if (!myId) return res.status(400).json({ ok: false, message: 'Не вошёл' });
+
+  try {
+    let result;
+
+    if (chatId) {
+      // Групповой чат
+      result = await pool.query(
+        `SELECT
+           m.id, m.from_user, m.to_user, m.chat_id, m.text, m.image_url, m.created_at,
+           u.name AS sender_name, u.email AS sender_email, u.avatar_url AS sender_avatar,
+           COALESCE(
+             (SELECT json_agg(json_build_object('user_id', r.user_id, 'emoji', r.emoji))
+              FROM reactions r WHERE r.message_id = m.id),
+             '[]'::json
+           ) AS reactions
+         FROM messages m
+         LEFT JOIN users u ON u.id = m.from_user
+         WHERE m.chat_id = $1
+         ORDER BY m.id ASC`,
+        [chatId]
+      );
+    } else if (withUserId) {
+      // Личный чат
+      result = await pool.query(
+        `SELECT
+           m.id, m.from_user, m.to_user, m.chat_id, m.text, m.image_url, m.created_at,
+           COALESCE(
+             (SELECT json_agg(json_build_object('user_id', r.user_id, 'emoji', r.emoji))
+              FROM reactions r WHERE r.message_id = m.id),
+             '[]'::json
+           ) AS reactions
+         FROM messages m
+         WHERE m.chat_id IS NULL
+           AND ((m.from_user = $1 AND m.to_user = $2)
+             OR (m.from_user = $2 AND m.to_user = $1))
+         ORDER BY m.id ASC`,
+        [myId, withUserId]
+      );
+    } else {
+      return res.status(400).json({ ok: false, message: 'Не указан чат' });
+    }
+
     res.json({ ok: true, messages: result.rows });
   } catch (err) {
+    console.error('Ошибка базы:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
@@ -223,81 +372,57 @@ app.post('/upload', upload.single('image'), async (req, res) => {
   res.json({ ok: true, imageUrl });
 });
 
-// ============= СТОРИС =============
-
-// Получить все активные сторис (сгруппированные по пользователю)
-app.get('/stories', async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT s.id, s.user_id, s.image_url, s.created_at,
-             u.name, u.email, u.avatar_url
-      FROM stories s
-      JOIN users u ON u.id = s.user_id
-      WHERE s.created_at > NOW() - INTERVAL '24 hours'
-      ORDER BY s.created_at ASC
-    `);
-    res.json({ ok: true, stories: result.rows });
-  } catch (err) {
-    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
-  }
-});
-
-// Добавить сторис
-app.post('/add-story', async (req, res) => {
-  const { userId, imageUrl } = req.body;
-  const uid = parseInt(userId) || req.session.userId;
-  if (!uid || !imageUrl) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
-  try {
-    const result = await pool.query(
-      'INSERT INTO stories (user_id, image_url) VALUES ($1, $2) RETURNING id, created_at',
-      [uid, imageUrl]
-    );
-    io.emit('story_added', {
-      id: result.rows[0].id,
-      user_id: uid,
-      image_url: imageUrl,
-      created_at: result.rows[0].created_at
-    });
-    res.json({ ok: true, id: result.rows[0].id });
-  } catch (err) {
-    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
-  }
-});
-
-// Удалить свою сторис
-app.delete('/stories/:id', async (req, res) => {
-  const storyId = parseInt(req.params.id);
-  const userId = parseInt(req.query.userId) || req.session.userId;
-  if (!storyId || !userId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
-  try {
-    const check = await pool.query('SELECT user_id, image_url FROM stories WHERE id = $1', [storyId]);
-    if (check.rows.length === 0) return res.status(404).json({ ok: false, message: 'Не найдено' });
-    if (check.rows[0].user_id !== userId) return res.status(403).json({ ok: false, message: 'Не твоя сторис' });
-
-    const imgUrl = check.rows[0].image_url;
-    if (imgUrl && imgUrl.startsWith('/uploads/')) {
-      const filename = imgUrl.replace('/uploads/', '');
-      fs.unlink(path.join(uploadsDir, filename), () => {});
-    }
-
-    await pool.query('DELETE FROM stories WHERE id = $1', [storyId]);
-    io.emit('story_deleted', { id: storyId, user_id: userId });
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
-  }
-});
-
+// Отправить сообщение — работает и для личных, и для групп
 app.post('/send', async (req, res) => {
-  const { to, text, from, imageUrl } = req.body;
+  const { to, text, from, imageUrl, chatId } = req.body;
   const fromUserId = parseInt(from) || req.session.userId;
   const toUserId = parseInt(to);
+  const cid = parseInt(chatId);
   const textTrim = (text || '').trim();
   const imgUrl = (imageUrl || '').trim();
 
-  if (!fromUserId || !toUserId || (!textTrim && !imgUrl)) {
+  if (!fromUserId || (!textTrim && !imgUrl)) {
     return res.status(400).json({ ok: false, message: 'Не хватает данных' });
   }
+
+  // Групповое сообщение
+  if (cid) {
+    try {
+      const result = await pool.query(
+        'INSERT INTO messages (from_user, chat_id, text, image_url) VALUES ($1, $2, $3, $4) RETURNING id, created_at',
+        [fromUserId, cid, textTrim, imgUrl]
+      );
+
+      // Получаем имя автора
+      const userRes = await pool.query('SELECT name, email, avatar_url FROM users WHERE id = $1', [fromUserId]);
+      const sender = userRes.rows[0] || {};
+
+      // Все участники группы — получают оповещение
+      const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [cid]);
+      for (const row of membersRes.rows) {
+        io.to('user_' + row.user_id).emit('message', {
+          id: result.rows[0].id,
+          from: fromUserId,
+          chat_id: cid,
+          text: textTrim,
+          image_url: imgUrl,
+          created_at: result.rows[0].created_at,
+          sender_name: sender.name || sender.email,
+          sender_email: sender.email,
+          sender_avatar: sender.avatar_url || '',
+          reactions: []
+        });
+      }
+
+      return res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at });
+    } catch (err) {
+      console.error('Ошибка базы:', err.message);
+      return res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+    }
+  }
+
+  // Личное сообщение
+  if (!toUserId) return res.status(400).json({ ok: false, message: 'Не указан получатель' });
 
   try {
     const result = await pool.query(
@@ -308,6 +433,7 @@ app.post('/send', async (req, res) => {
       id: result.rows[0].id,
       from: fromUserId,
       to: toUserId,
+      chat_id: null,
       text: textTrim,
       image_url: imgUrl,
       created_at: result.rows[0].created_at,
@@ -324,7 +450,7 @@ app.delete('/messages/:id', async (req, res) => {
   const userId = parseInt(req.query.userId) || req.session.userId;
   if (!messageId || !userId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
   try {
-    const check = await pool.query('SELECT from_user, to_user, image_url FROM messages WHERE id = $1', [messageId]);
+    const check = await pool.query('SELECT from_user, to_user, chat_id, image_url FROM messages WHERE id = $1', [messageId]);
     if (check.rows.length === 0) return res.status(404).json({ ok: false, message: 'Сообщение не найдено' });
     if (check.rows[0].from_user !== userId) return res.status(403).json({ ok: false, message: 'Можно удалять только свои' });
 
@@ -336,11 +462,21 @@ app.delete('/messages/:id', async (req, res) => {
 
     await pool.query('DELETE FROM reactions WHERE message_id = $1', [messageId]);
     await pool.query('DELETE FROM messages WHERE id = $1', [messageId]);
-    io.emit('message_deleted', {
-      id: messageId,
-      from: check.rows[0].from_user,
-      to: check.rows[0].to_user
-    });
+
+    if (check.rows[0].chat_id) {
+      // Групповое — оповещаем всех участников
+      const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [check.rows[0].chat_id]);
+      for (const row of membersRes.rows) {
+        io.to('user_' + row.user_id).emit('message_deleted', { id: messageId });
+      }
+    } else {
+      io.emit('message_deleted', {
+        id: messageId,
+        from: check.rows[0].from_user,
+        to: check.rows[0].to_user
+      });
+    }
+
     res.json({ ok: true, message: 'Сообщение удалено' });
   } catch (err) {
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
@@ -371,16 +507,17 @@ app.post('/react', async (req, res) => {
       action = 'added';
     }
 
-    const msg = await pool.query('SELECT from_user, to_user FROM messages WHERE id = $1', [mid]);
+    const msg = await pool.query('SELECT from_user, to_user, chat_id FROM messages WHERE id = $1', [mid]);
     if (msg.rows.length > 0) {
-      io.emit('reaction_update', {
-        messageId: mid,
-        userId: uid,
-        emoji,
-        action,
-        from: msg.rows[0].from_user,
-        to: msg.rows[0].to_user
-      });
+      const payload = { messageId: mid, userId: uid, emoji, action };
+      if (msg.rows[0].chat_id) {
+        const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [msg.rows[0].chat_id]);
+        for (const row of membersRes.rows) {
+          io.to('user_' + row.user_id).emit('reaction_update', payload);
+        }
+      } else {
+        io.emit('reaction_update', payload);
+      }
     }
     res.json({ ok: true, action });
   } catch (err) {
@@ -388,6 +525,63 @@ app.post('/react', async (req, res) => {
   }
 });
 
+// ============ СТОРИС ============
+app.get('/stories', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT s.id, s.user_id, s.image_url, s.created_at,
+             u.name, u.email, u.avatar_url
+      FROM stories s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.created_at > NOW() - INTERVAL '24 hours'
+      ORDER BY s.created_at ASC
+    `);
+    res.json({ ok: true, stories: result.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+app.post('/add-story', async (req, res) => {
+  const { userId, imageUrl } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  if (!uid || !imageUrl) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  try {
+    const result = await pool.query(
+      'INSERT INTO stories (user_id, image_url) VALUES ($1, $2) RETURNING id, created_at',
+      [uid, imageUrl]
+    );
+    io.emit('story_added', { id: result.rows[0].id, user_id: uid, image_url: imageUrl, created_at: result.rows[0].created_at });
+    res.json({ ok: true, id: result.rows[0].id });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+app.delete('/stories/:id', async (req, res) => {
+  const storyId = parseInt(req.params.id);
+  const userId = parseInt(req.query.userId) || req.session.userId;
+  if (!storyId || !userId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  try {
+    const check = await pool.query('SELECT user_id, image_url FROM stories WHERE id = $1', [storyId]);
+    if (check.rows.length === 0) return res.status(404).json({ ok: false, message: 'Не найдено' });
+    if (check.rows[0].user_id !== userId) return res.status(403).json({ ok: false, message: 'Не твоя сторис' });
+
+    const imgUrl = check.rows[0].image_url;
+    if (imgUrl && imgUrl.startsWith('/uploads/')) {
+      const filename = imgUrl.replace('/uploads/', '');
+      fs.unlink(path.join(uploadsDir, filename), () => {});
+    }
+
+    await pool.query('DELETE FROM stories WHERE id = $1', [storyId]);
+    io.emit('story_deleted', { id: storyId, user_id: userId });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// ============ WebSocket ============
 io.on('connection', (socket) => {
   socket.on('identify', (userId) => {
     const uid = parseInt(userId);
@@ -401,11 +595,28 @@ io.on('connection', (socket) => {
   });
 
   socket.on('typing', (data) => {
-    if (!data || !data.to || !socket.userId) return;
-    io.to('user_' + data.to).emit('user_typing', {
-      from: socket.userId,
-      typing: !!data.typing,
-    });
+    if (!data || !socket.userId) return;
+    if (data.chatId) {
+      // Для группы — оповещаем всех участников
+      pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [data.chatId])
+        .then(result => {
+          for (const row of result.rows) {
+            if (row.user_id !== socket.userId) {
+              io.to('user_' + row.user_id).emit('user_typing', {
+                chatId: data.chatId,
+                from: socket.userId,
+                typing: !!data.typing,
+              });
+            }
+          }
+        })
+        .catch(() => {});
+    } else if (data.to) {
+      io.to('user_' + data.to).emit('user_typing', {
+        from: socket.userId,
+        typing: !!data.typing,
+      });
+    }
   });
 
   socket.on('disconnect', () => {
