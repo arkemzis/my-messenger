@@ -473,7 +473,7 @@ app.post('/upload', upload.single('image'), async (req, res) => {
   res.json({ ok: true, imageUrl });
 });
 
-, async (req, res) => {
+app.post('/send', async (req, res) => {
   const { to, text, from, imageUrl, chatId } = req.body;
   const fromUserId = parseInt(from) || req.session.userId;
   const toUserId = parseInt(to);
