@@ -35,6 +35,7 @@ async function initDatabase() {
     `);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_id INTEGER`);
+        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited BOOLEAN DEFAULT FALSE`);
     await pool.query(`ALTER TABLE messages ALTER COLUMN text SET DEFAULT ''`);
     await pool.query(`ALTER TABLE messages ALTER COLUMN to_user DROP NOT NULL`);
 
@@ -472,7 +473,7 @@ app.post('/upload', upload.single('image'), async (req, res) => {
   res.json({ ok: true, imageUrl });
 });
 
-app.post('/send', async (req, res) => {
+, async (req, res) => {
   const { to, text, from, imageUrl, chatId } = req.body;
   const fromUserId = parseInt(from) || req.session.userId;
   const toUserId = parseInt(to);
@@ -550,6 +551,53 @@ app.post('/send', async (req, res) => {
     });
     res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at });
   } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+// Редактировать сообщение
+app.post('/edit-message', async (req, res) => {
+  const { messageId, userId, newText } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  const mid = parseInt(messageId);
+  if (!mid || !uid || !newText || !newText.trim()) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+
+  try {
+    const check = await pool.query(
+      'SELECT from_user, chat_id, to_user FROM messages WHERE id = $1',
+      [mid]
+    );
+    if (check.rows.length === 0) {
+      return res.status(404).json({ ok: false, message: 'Сообщение не найдено' });
+    }
+    if (check.rows[0].from_user !== uid) {
+      return res.status(403).json({ ok: false, message: 'Редактировать можно только свои' });
+    }
+
+    await pool.query(
+      'UPDATE messages SET text = $1, edited = TRUE WHERE id = $2',
+      [newText.trim(), mid]
+    );
+
+    // Оповещаем
+    const chatId = check.rows[0].chat_id;
+    const toUser = check.rows[0].to_user;
+    const payload = { id: mid, newText: newText.trim(), from: uid };
+
+    if (chatId) {
+      const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [chatId]);
+      for (const row of membersRes.rows) {
+        io.to('user_' + row.user_id).emit('message_edited', payload);
+      }
+    } else {
+      io.to('user_' + toUser).emit('message_edited', payload);
+      io.to('user_' + uid).emit('message_edited', payload);
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Ошибка базы:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
