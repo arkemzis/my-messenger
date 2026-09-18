@@ -43,9 +43,11 @@ async function initDatabase() {
         id SERIAL PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
         created_by INTEGER NOT NULL,
+        is_channel BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
+    await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS is_channel BOOLEAN DEFAULT FALSE`);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS chat_members (
@@ -213,26 +215,26 @@ app.get('/users', async (req, res) => {
   }
 });
 
-// ============ ГРУППЫ ============
+// ============ ГРУППЫ И КАНАЛЫ ============
 
-// Создать группу
+// Создать группу или канал
 app.post('/create-group', async (req, res) => {
-  const { userId, name, memberIds } = req.body;
+  const { userId, name, memberIds, isChannel } = req.body;
   const uid = parseInt(userId) || req.session.userId;
+  const isCh = isChannel === true;
   if (!uid || !name || !name.trim()) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
 
   try {
     const chatResult = await pool.query(
-      'INSERT INTO chats (name, created_by) VALUES ($1, $2) RETURNING id, name, created_at',
-      [name.trim(), uid]
+      'INSERT INTO chats (name, created_by, is_channel) VALUES ($1, $2, $3) RETURNING id, name, is_channel, created_at',
+      [name.trim(), uid, isCh]
     );
     const chatId = chatResult.rows[0].id;
 
-    // Добавляем создателя
     await pool.query('INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [chatId, uid]);
 
-    // Добавляем участников
-    if (Array.isArray(memberIds)) {
+    // В канал НЕ добавляем участников сразу — они подписываются сами
+    if (!isCh && Array.isArray(memberIds)) {
       for (const mid of memberIds) {
         const m = parseInt(mid);
         if (m && m !== uid) {
@@ -241,21 +243,21 @@ app.post('/create-group', async (req, res) => {
       }
     }
 
-    res.json({ ok: true, chatId, name: chatResult.rows[0].name });
+    res.json({ ok: true, chatId, name: chatResult.rows[0].name, isChannel: isCh });
   } catch (err) {
-    console.error('Ошибка создания группы:', err.message);
+    console.error('Ошибка создания:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
 
-// Мои группы
+// Мои группы и каналы
 app.get('/my-chats', async (req, res) => {
   const uid = parseInt(req.query.userId) || req.session.userId;
   if (!uid) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
 
   try {
     const result = await pool.query(
-      `SELECT c.id, c.name, c.created_by, c.created_at,
+      `SELECT c.id, c.name, c.created_by, c.is_channel, c.created_at,
               (SELECT COUNT(*) FROM chat_members cm2 WHERE cm2.chat_id = c.id) AS members_count
        FROM chats c
        JOIN chat_members cm ON cm.chat_id = c.id
@@ -269,7 +271,39 @@ app.get('/my-chats', async (req, res) => {
   }
 });
 
-// Участники группы
+// Все публичные каналы (для поиска)
+app.get('/all-channels', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT c.id, c.name, c.created_by, c.created_at,
+              (SELECT COUNT(*) FROM chat_members cm WHERE cm.chat_id = c.id) AS members_count
+       FROM chats c
+       WHERE c.is_channel = TRUE
+       ORDER BY c.created_at DESC`
+    );
+    res.json({ ok: true, channels: result.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Информация о чате (для определения админа)
+app.get('/chat-info/:chatId', async (req, res) => {
+  const chatId = parseInt(req.params.chatId);
+  if (!chatId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  try {
+    const result = await pool.query(
+      'SELECT id, name, created_by, is_channel FROM chats WHERE id = $1',
+      [chatId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ ok: false, message: 'Не найдено' });
+    res.json({ ok: true, chat: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Участники
 app.get('/chat-members/:chatId', async (req, res) => {
   const chatId = parseInt(req.params.chatId);
   if (!chatId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
@@ -289,7 +323,25 @@ app.get('/chat-members/:chatId', async (req, res) => {
   }
 });
 
-// Добавить участника
+// Подписаться на канал
+app.post('/join-channel', async (req, res) => {
+  const { chatId, userId } = req.body;
+  const cid = parseInt(chatId);
+  const uid = parseInt(userId) || req.session.userId;
+  if (!cid || !uid) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+
+  try {
+    await pool.query(
+      'INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [cid, uid]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Добавить участника (только для групп)
 app.post('/add-member', async (req, res) => {
   const { chatId, userId } = req.body;
   const cid = parseInt(chatId);
@@ -297,6 +349,11 @@ app.post('/add-member', async (req, res) => {
   if (!cid || !uid) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
 
   try {
+    const chatInfo = await pool.query('SELECT is_channel FROM chats WHERE id = $1', [cid]);
+    if (chatInfo.rows[0]?.is_channel) {
+      return res.status(400).json({ ok: false, message: 'В канал нельзя добавить — только подписка' });
+    }
+
     await pool.query(
       'INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
       [cid, uid]
@@ -310,7 +367,6 @@ app.post('/add-member', async (req, res) => {
 
 // ============ СООБЩЕНИЯ ============
 
-// Получить сообщения — работает и для личных, и для групп
 app.get('/messages', async (req, res) => {
   const myId = parseInt(req.query.me) || req.session.userId;
   const withUserId = parseInt(req.query.with);
@@ -322,7 +378,6 @@ app.get('/messages', async (req, res) => {
     let result;
 
     if (chatId) {
-      // Групповой чат
       result = await pool.query(
         `SELECT
            m.id, m.from_user, m.to_user, m.chat_id, m.text, m.image_url, m.created_at,
@@ -339,7 +394,6 @@ app.get('/messages', async (req, res) => {
         [chatId]
       );
     } else if (withUserId) {
-      // Личный чат
       result = await pool.query(
         `SELECT
            m.id, m.from_user, m.to_user, m.chat_id, m.text, m.image_url, m.created_at,
@@ -372,7 +426,6 @@ app.post('/upload', upload.single('image'), async (req, res) => {
   res.json({ ok: true, imageUrl });
 });
 
-// Отправить сообщение — работает и для личных, и для групп
 app.post('/send', async (req, res) => {
   const { to, text, from, imageUrl, chatId } = req.body;
   const fromUserId = parseInt(from) || req.session.userId;
@@ -385,19 +438,29 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ ok: false, message: 'Не хватает данных' });
   }
 
-  // Групповое сообщение
+  // Группа или канал
   if (cid) {
     try {
+      const chatInfo = await pool.query('SELECT is_channel, created_by FROM chats WHERE id = $1', [cid]);
+      if (chatInfo.rows.length === 0) {
+        return res.status(404).json({ ok: false, message: 'Чат не найден' });
+      }
+      const isChannel = chatInfo.rows[0].is_channel;
+      const adminId = chatInfo.rows[0].created_by;
+
+      // В канале — только админ может писать
+      if (isChannel && fromUserId !== adminId) {
+        return res.status(403).json({ ok: false, message: 'Только админ может писать в канал' });
+      }
+
       const result = await pool.query(
         'INSERT INTO messages (from_user, chat_id, text, image_url) VALUES ($1, $2, $3, $4) RETURNING id, created_at',
         [fromUserId, cid, textTrim, imgUrl]
       );
 
-      // Получаем имя автора
       const userRes = await pool.query('SELECT name, email, avatar_url FROM users WHERE id = $1', [fromUserId]);
       const sender = userRes.rows[0] || {};
 
-      // Все участники группы — получают оповещение
       const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [cid]);
       for (const row of membersRes.rows) {
         io.to('user_' + row.user_id).emit('message', {
@@ -464,7 +527,6 @@ app.delete('/messages/:id', async (req, res) => {
     await pool.query('DELETE FROM messages WHERE id = $1', [messageId]);
 
     if (check.rows[0].chat_id) {
-      // Групповое — оповещаем всех участников
       const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [check.rows[0].chat_id]);
       for (const row of membersRes.rows) {
         io.to('user_' + row.user_id).emit('message_deleted', { id: messageId });
@@ -597,7 +659,6 @@ io.on('connection', (socket) => {
   socket.on('typing', (data) => {
     if (!data || !socket.userId) return;
     if (data.chatId) {
-      // Для группы — оповещаем всех участников
       pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [data.chatId])
         .then(result => {
           for (const row of result.rows) {
