@@ -4,6 +4,7 @@ const session = require('express-session');
 const http = require('http');
 const { Server } = require('socket.io');
 const pool = require('./db');
+
 // Автоматическое создание таблиц при старте
 async function initDatabase() {
   try {
@@ -30,6 +31,7 @@ async function initDatabase() {
   }
 }
 initDatabase();
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -42,6 +44,10 @@ app.use(session({
   saveUninitialized: false,
   cookie: { maxAge: 1000 * 60 * 60 * 24 * 7 }
 }));
+
+// ===== HTTP + WebSocket =====
+const server = http.createServer(app);
+const io = new Server(server);
 
 // Главная
 app.get('/', (req, res) => {
@@ -160,6 +166,7 @@ app.post('/send', async (req, res) => {
     );
 
     io.emit('message', {
+      id: result.rows[0].id,
       from: fromUserId,
       to: toUserId,
       text: text.trim(),
@@ -173,10 +180,45 @@ app.post('/send', async (req, res) => {
   }
 });
 
-// HTTP-сервер + WebSocket
-const server = http.createServer(app);
-const io = new Server(server);
+// Удалить сообщение
+app.delete('/messages/:id', async (req, res) => {
+  const messageId = parseInt(req.params.id);
+  const userId = parseInt(req.query.userId) || req.session.userId;
 
+  if (!messageId || !userId) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+
+  try {
+    const check = await pool.query(
+      'SELECT from_user, to_user FROM messages WHERE id = $1',
+      [messageId]
+    );
+
+    if (check.rows.length === 0) {
+      return res.status(404).json({ ok: false, message: 'Сообщение не найдено' });
+    }
+
+    if (check.rows[0].from_user !== userId) {
+      return res.status(403).json({ ok: false, message: 'Можно удалять только свои сообщения' });
+    }
+
+    await pool.query('DELETE FROM messages WHERE id = $1', [messageId]);
+
+    io.emit('message_deleted', {
+      id: messageId,
+      from: check.rows[0].from_user,
+      to: check.rows[0].to_user
+    });
+
+    res.json({ ok: true, message: 'Сообщение удалено' });
+  } catch (err) {
+    console.error('Ошибка базы:', err.message);
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// ===== WebSocket =====
 io.on('connection', (socket) => {
   console.log('WebSocket подключён:', socket.id);
 
@@ -191,6 +233,7 @@ io.on('connection', (socket) => {
   });
 });
 
+// Запуск
 server.listen(PORT, () => {
   console.log(`Сервер запущен: http://localhost:${PORT}`);
 });
