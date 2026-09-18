@@ -234,6 +234,6 @@ io.on('connection', (socket) => {
 });
 
 // Запуск
-server.listen(PORT, () => {
-  console.log(`Сервер запущен: http://localhost:${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Сервер запущен на порту ${PORT}`);
 });
