@@ -41,6 +41,8 @@ async function initDatabase() {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(100) DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(50) DEFAULT ''`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users (LOWER(username)) WHERE username <> ''`);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
@@ -223,14 +225,34 @@ app.post('/login', async (req, res) => {
   }
 });
 
-app.post('/set-name', async (req, res) => {
-  const { userId, name } = req.body;
+app.post('/set-username', async (req, res) => {
+  const { userId, username } = req.body;
   const uid = parseInt(userId) || req.session.userId;
-  if (!uid || !name || !name.trim()) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  if (!uid || !username || !username.trim()) {
+    return res.status(400).json({ ok: false, message: 'Введите ник' });
+  }
+  const u = username.trim();
+  if (!/^[a-zA-Z0-9_]{3,20}$/.test(u)) {
+    return res.status(400).json({
+      ok: false,
+      message: 'Ник: 3–20 символов, только латиница, цифры и _'
+    });
+  }
   try {
-    await pool.query('UPDATE users SET name = $1 WHERE id = $2', [name.trim(), uid]);
-    res.json({ ok: true, message: 'Имя сохранено' });
+    const existing = await pool.query(
+      'SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id != $2',
+      [u, uid]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ ok: false, message: 'Этот ник уже занят' });
+    }
+    await pool.query(
+      'UPDATE users SET username = $1, name = $1 WHERE id = $2',
+      [u, uid]
+    );
+    res.json({ ok: true, message: 'Ник сохранён', username: u });
   } catch (err) {
+    console.error('set-username error:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
@@ -261,21 +283,51 @@ app.get('/users', async (req, res) => {
   const myId = parseInt(req.query.me) || req.session.userId || 0;
   try {
     const result = await pool.query(`
-      SELECT u.id, u.email, u.name, u.avatar_url, pk.public_key,
+      SELECT u.id, u.username, u.avatar_url, pk.public_key,
              hc.hidden_at,
              (SELECT COUNT(*) FROM messages m
               WHERE m.chat_id IS NULL
                 AND m.from_user = u.id
                 AND m.to_user = $1
-                AND m.read_at IS NULL) AS unread_count
+                AND m.read_at IS NULL) AS unread_count,
+             (SELECT MAX(m.created_at) FROM messages m
+              WHERE m.chat_id IS NULL
+                AND ((m.from_user = u.id AND m.to_user = $1)
+                  OR (m.from_user = $1 AND m.to_user = u.id))) AS last_msg_at
       FROM users u
       LEFT JOIN public_keys pk ON pk.user_id = u.id
       LEFT JOIN hidden_chats hc ON hc.user_id = $1 AND hc.peer_id = u.id
-      ORDER BY u.id
+      ORDER BY last_msg_at DESC NULLS LAST, u.id
     `, [myId]);
     const users = result.rows.map(u => ({ ...u, online: onlineUsers.has(u.id) }));
     res.json(users);
   } catch (err) {
+    console.error('/users error:', err.message);
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Поиск людей по нику
+app.get('/search-users', async (req, res) => {
+  const myId = parseInt(req.query.me) || req.session.userId || 0;
+  const q = (req.query.q || '').trim().toLowerCase();
+  if (!myId) return res.status(400).json({ ok: false, message: 'Не вошёл' });
+  if (q.length < 2) return res.json({ ok: true, users: [] });
+  try {
+    const result = await pool.query(`
+      SELECT u.id, u.username, u.avatar_url, pk.public_key
+      FROM users u
+      LEFT JOIN public_keys pk ON pk.user_id = u.id
+      WHERE u.id != $1
+        AND u.username <> ''
+        AND LOWER(u.username) LIKE $2
+      ORDER BY u.username ASC
+      LIMIT 30
+    `, [myId, '%' + q + '%']);
+    const users = result.rows.map(u => ({ ...u, online: onlineUsers.has(u.id) }));
+    res.json({ ok: true, users });
+  } catch (err) {
+    console.error('/search-users error:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
@@ -664,7 +716,7 @@ app.post('/send', async (req, res) => {
         [fromUserId, cid, textTrim, imgUrl, replyId, fUrl, fName, fSize, fType]
       );
 
-      const userRes = await pool.query('SELECT name, email, avatar_url FROM users WHERE id = $1', [fromUserId]);
+      const userRes = await pool.query('SELECT username, avatar_url FROM users WHERE id = $1', [fromUserId]);
       const sender = userRes.rows[0] || {};
 
       const replyInfo = await getReplyInfo(replyId);
@@ -684,8 +736,8 @@ app.post('/send', async (req, res) => {
           created_at: result.rows[0].created_at,
           edited: false,
           read_at: null,
-          sender_name: sender.name || sender.email,
-          sender_email: sender.email,
+          sender_name: sender.username || 'Пользователь',
+          sender_email: '',
           sender_avatar: sender.avatar_url || '',
           reactions: [],
           ...replyInfo,
@@ -697,7 +749,7 @@ app.post('/send', async (req, res) => {
       try {
         const chatNameRes = await pool.query('SELECT name FROM chats WHERE id = $1', [cid]);
         const chatName = chatNameRes.rows[0]?.name || 'Чат';
-        const senderName = sender.name || sender.email || 'Кто-то';
+        const senderName = sender.username || 'Пользователь';
         let preview = textTrim;
         if (preview.startsWith('E2EE:')) preview = '🔒 Зашифрованное сообщение';
         if (!preview && imgUrl) preview = '📷 Фото';
@@ -763,9 +815,9 @@ app.post('/send', async (req, res) => {
 
     // Push получателю
     try {
-      const senderRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [fromUserId]);
+      const senderRes = await pool.query('SELECT username FROM users WHERE id = $1', [fromUserId]);
       const sender = senderRes.rows[0] || {};
-      const senderName = sender.name || sender.email || 'Кто-то';
+      const senderName = sender.username || 'Пользователь';
       let preview = textTrim;
       if (preview.startsWith('E2EE:')) preview = '🔒 Зашифрованное сообщение';
       if (!preview && imgUrl) preview = '📷 Фото';
