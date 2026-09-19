@@ -6,6 +6,29 @@ const http = require('http');
 const multer = require('multer');
 const { Server } = require('socket.io');
 const pool = require('./db');
+const nodemailer = require('nodemailer');
+
+// ============ EMAIL (Gmail SMTP) ============
+let mailer = null;
+try {
+  if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
+    mailer = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_APP_PASSWORD,
+      },
+    });
+    console.log('✅ Gmail SMTP готов');
+  } else {
+    console.log('⚠️ GMAIL_USER / GMAIL_APP_PASSWORD не заданы');
+  }
+} catch (err) {
+  console.error('Ошибка инициализации почты:', err.message);
+}
+
+const FROM_NAME = process.env.GMAIL_FROM_NAME || 'ARKZIS';
+const FROM_ADDRESS = process.env.GMAIL_USER || '';
 
 // ============ FIREBASE ADMIN ============
 let firebaseAdmin = null;
@@ -132,6 +155,19 @@ async function initDatabase() {
         UNIQUE(user_id, chat_id)
       )
     `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS email_codes (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        code VARCHAR(10) NOT NULL,
+        attempts INTEGER DEFAULT 0,
+        used BOOLEAN DEFAULT FALSE,
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS email_codes_email_idx ON email_codes (LOWER(email))`);
+
     console.log('✅ Таблицы готовы');
   } catch (err) {
     console.error('Ошибка создания таблиц:', err.message);
@@ -190,6 +226,132 @@ function getOnlineIds() { return Array.from(onlineUsers.keys()); }
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ============ РЕГИСТРАЦИЯ ПО КОДУ ============
+
+// Шаг 1: отправить код на email
+app.post('/send-code', async (req, res) => {
+  const { email } = req.body;
+  if (!email || !email.trim()) {
+    return res.status(400).json({ ok: false, message: 'Введите email' });
+  }
+  const cleanEmail = email.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    return res.status(400).json({ ok: false, message: 'Неверный формат email' });
+  }
+  if (!mailer) {
+    return res.status(500).json({ ok: false, message: 'Почта не настроена на сервере' });
+  }
+
+  try {
+    // Проверяем, не занят ли уже
+    const existing = await pool.query(
+      'SELECT id FROM users WHERE LOWER(email) = $1',
+      [cleanEmail]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ ok: false, message: 'Этот email уже зарегистрирован' });
+    }
+
+    // Генерируем 6-значный код
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 минут
+
+    // Чистим старые коды для этого email
+    await pool.query('DELETE FROM email_codes WHERE LOWER(email) = $1', [cleanEmail]);
+
+    // Сохраняем новый код
+    await pool.query(
+      `INSERT INTO email_codes (email, code, expires_at) VALUES ($1, $2, $3)`,
+      [cleanEmail, code, expiresAt]
+    );
+
+    // Отправляем письмо
+    await mailer.sendMail({
+      from: `"${FROM_NAME}" <${FROM_ADDRESS}>`,
+      to: cleanEmail,
+      subject: `${FROM_NAME} — код подтверждения`,
+      text: `Ваш код подтверждения: ${code}\n\nКод действует 10 минут.`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">
+          <h2 style="color: #7C3AED; margin: 0 0 12px;">${FROM_NAME}</h2>
+          <p style="font-size: 15px; color: #333;">Ваш код подтверждения:</p>
+          <div style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #7C3AED; padding: 16px; background: #F3E8FF; border-radius: 8px; text-align: center; margin: 16px 0;">
+            ${code}
+          </div>
+          <p style="font-size: 13px; color: #666;">Код действует 10 минут. Если вы не регистрировались — просто проигнорируйте это письмо.</p>
+        </div>
+      `,
+    });
+
+    console.log(`📧 Код для ${cleanEmail}: ${code}`);
+    res.json({ ok: true, message: 'Код отправлен на почту' });
+  } catch (err) {
+    console.error('send-code error:', err.message);
+    res.status(500).json({ ok: false, message: 'Не удалось отправить код' });
+  }
+});
+
+// Шаг 2: проверить код и завершить регистрацию
+app.post('/verify-code', async (req, res) => {
+  const { email, code, password } = req.body;
+  if (!email || !code || !password) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+  const cleanEmail = email.trim().toLowerCase();
+  const cleanCode = code.trim();
+
+  try {
+    const result = await pool.query(
+      `SELECT id, code, attempts, used, expires_at
+       FROM email_codes
+       WHERE LOWER(email) = $1
+       ORDER BY id DESC LIMIT 1`,
+      [cleanEmail]
+    );
+    if (result.rows.length === 0) {
+      return res.status(400).json({ ok: false, message: 'Сначала запросите код' });
+    }
+    const row = result.rows[0];
+
+    if (row.used) {
+      return res.status(400).json({ ok: false, message: 'Код уже использован' });
+    }
+    if (new Date(row.expires_at) < new Date()) {
+      return res.status(400).json({ ok: false, message: 'Код истёк, запросите новый' });
+    }
+    if (row.attempts >= 5) {
+      return res.status(429).json({ ok: false, message: 'Слишком много попыток, запросите новый код' });
+    }
+    if (row.code !== cleanCode) {
+      await pool.query('UPDATE email_codes SET attempts = attempts + 1 WHERE id = $1', [row.id]);
+      return res.status(400).json({ ok: false, message: 'Неверный код' });
+    }
+
+    // Код верный — создаём пользователя
+    const existing = await pool.query(
+      'SELECT id FROM users WHERE LOWER(email) = $1',
+      [cleanEmail]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ ok: false, message: 'Этот email уже зарегистрирован' });
+    }
+
+    const userResult = await pool.query(
+      'INSERT INTO users (email, password) VALUES ($1, $2) RETURNING id',
+      [cleanEmail, password]
+    );
+    const userId = userResult.rows[0].id;
+
+    await pool.query('UPDATE email_codes SET used = TRUE WHERE id = $1', [row.id]);
+    req.session.userId = userId;
+
+    res.json({ ok: true, message: 'Регистрация успешна!', userId });
+  } catch (err) {
+    console.error('verify-code error:', err.message);
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
 });
 
 app.post('/register', async (req, res) => {
