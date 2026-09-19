@@ -82,6 +82,24 @@ async function initDatabase() {
       )
     `);
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS hidden_chats (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        peer_id INTEGER NOT NULL,
+        hidden_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id, peer_id)
+      )
+    `);
+        await pool.query(`
+      CREATE TABLE IF NOT EXISTS hidden_chat_groups (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        hidden_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id, chat_id)
+      )
+    `);
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS public_keys (
         user_id INTEGER PRIMARY KEY,
         public_key TEXT NOT NULL,
@@ -312,7 +330,9 @@ app.get('/my-chats', async (req, res) => {
               (SELECT COUNT(*) FROM messages m
                WHERE m.chat_id = c.id
                  AND m.from_user != $1
-                 AND m.read_at IS NULL) AS unread_count
+                 AND m.read_at IS NULL) AS unread_count,
+              (SELECT hidden_at FROM hidden_chat_groups hcg
+               WHERE hcg.user_id = $1 AND hcg.chat_id = c.id) AS hidden_at
        FROM chats c
        JOIN chat_members cm ON cm.chat_id = c.id
        WHERE cm.user_id = $1
@@ -324,7 +344,6 @@ app.get('/my-chats', async (req, res) => {
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
-
 app.get('/all-channels', async (req, res) => {
   try {
     const result = await pool.query(
@@ -765,6 +784,124 @@ app.post('/react', async (req, res) => {
     }
     res.json({ ok: true, action });
   } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+// Скрыть чат у себя (для личных и групп)
+app.post('/hide-chat', async (req, res) => {
+  const { userId, peerId, chatId } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  const peer = parseInt(peerId);
+  const cid = parseInt(chatId);
+
+  if (!uid || (!peer && !cid)) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+
+  try {
+    if (cid) {
+      await pool.query(
+        `INSERT INTO hidden_chat_groups (user_id, chat_id, hidden_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (user_id, chat_id) DO UPDATE SET hidden_at = NOW()`,
+        [uid, cid]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO hidden_chats (user_id, peer_id, hidden_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (user_id, peer_id) DO UPDATE SET hidden_at = NOW()`,
+        [uid, peer]
+      );
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('hide-chat error:', err.message);
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// Удалить чат для всех (личка: удалить переписку у обоих; группа: только админ)
+app.post('/delete-chat-for-all', async (req, res) => {
+  const { userId, peerId, chatId } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  const peer = parseInt(peerId);
+  const cid = parseInt(chatId);
+
+  if (!uid || (!peer && !cid)) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+
+  try {
+    if (cid) {
+      // Группа — только создатель может удалить для всех
+      const chatInfo = await pool.query('SELECT created_by FROM chats WHERE id = $1', [cid]);
+      if (chatInfo.rows.length === 0) {
+        return res.status(404).json({ ok: false, message: 'Чат не найден' });
+      }
+      if (chatInfo.rows[0].created_by !== uid) {
+        return res.status(403).json({ ok: false, message: 'Только админ может удалить для всех' });
+      }
+
+      // Удалить все сообщения группы + вложения
+      const imagesRes = await pool.query(
+        `SELECT image_url FROM messages WHERE chat_id = $1 AND image_url != ''`,
+        [cid]
+      );
+      for (const row of imagesRes.rows) {
+        if (row.image_url && row.image_url.startsWith('/uploads/')) {
+          const filename = row.image_url.replace('/uploads/', '');
+          fs.unlink(path.join(uploadsDir, filename), () => {});
+        }
+      }
+      await pool.query('DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE chat_id = $1)', [cid]);
+      await pool.query('DELETE FROM messages WHERE chat_id = $1', [cid]);
+
+      // Оповестить всех участников
+      const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [cid]);
+      for (const row of membersRes.rows) {
+        io.to('user_' + row.user_id).emit('chat_deleted', { chatId: cid, forAll: true });
+      }
+
+      return res.json({ ok: true });
+    }
+
+    // Личка — удалить переписку у обоих
+    const imagesRes = await pool.query(
+      `SELECT image_url FROM messages
+       WHERE chat_id IS NULL
+         AND ((from_user = $1 AND to_user = $2) OR (from_user = $2 AND to_user = $1))
+         AND image_url != ''`,
+      [uid, peer]
+    );
+    for (const row of imagesRes.rows) {
+      if (row.image_url && row.image_url.startsWith('/uploads/')) {
+        const filename = row.image_url.replace('/uploads/', '');
+        fs.unlink(path.join(uploadsDir, filename), () => {});
+      }
+    }
+    await pool.query(
+      `DELETE FROM reactions WHERE message_id IN (
+         SELECT id FROM messages
+         WHERE chat_id IS NULL
+           AND ((from_user = $1 AND to_user = $2) OR (from_user = $2 AND to_user = $1))
+       )`,
+      [uid, peer]
+    );
+    await pool.query(
+      `DELETE FROM messages
+       WHERE chat_id IS NULL
+         AND ((from_user = $1 AND to_user = $2) OR (from_user = $2 AND to_user = $1))`,
+      [uid, peer]
+    );
+
+    // Оповестить обоих
+    io.to('user_' + peer).emit('chat_deleted', { peerId: uid, forAll: true });
+    io.to('user_' + uid).emit('chat_deleted', { peerId: peer, forAll: true });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('delete-chat-for-all error:', err.message);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
