@@ -699,6 +699,7 @@ app.post('/send', async (req, res) => {
         const chatName = chatNameRes.rows[0]?.name || 'Чат';
         const senderName = sender.name || sender.email || 'Кто-то';
         let preview = textTrim;
+        if (preview.startsWith('E2EE:')) preview = '🔒 Зашифрованное сообщение';
         if (!preview && imgUrl) preview = '📷 Фото';
         if (!preview && fUrl) preview = '📎 Файл';
         const pushTitle = chatName;
@@ -766,6 +767,7 @@ app.post('/send', async (req, res) => {
       const sender = senderRes.rows[0] || {};
       const senderName = sender.name || sender.email || 'Кто-то';
       let preview = textTrim;
+      if (preview.startsWith('E2EE:')) preview = '🔒 Зашифрованное сообщение';
       if (!preview && imgUrl) preview = '📷 Фото';
       if (!preview && fUrl) preview = '📎 Файл';
       sendPushToUser(
