@@ -6,29 +6,23 @@ const http = require('http');
 const multer = require('multer');
 const { Server } = require('socket.io');
 const pool = require('./db');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
-// ============ EMAIL (Gmail SMTP) ============
-let mailer = null;
+// ============ EMAIL (Resend) ============
+let resend = null;
 try {
-  if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
-    mailer = nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_APP_PASSWORD,
-      },
-    });
-    console.log('✅ Gmail SMTP готов');
+  if (process.env.RESEND_API_KEY) {
+    resend = new Resend(process.env.RESEND_API_KEY);
+    console.log('✅ Resend готов');
   } else {
-    console.log('⚠️ GMAIL_USER / GMAIL_APP_PASSWORD не заданы');
+    console.log('⚠️ RESEND_API_KEY не задан');
   }
 } catch (err) {
-  console.error('Ошибка инициализации почты:', err.message);
+  console.error('Ошибка инициализации Resend:', err.message);
 }
 
-const FROM_NAME = process.env.GMAIL_FROM_NAME || 'ARKZIS';
-const FROM_ADDRESS = process.env.GMAIL_USER || '';
+const FROM_NAME = 'ARKZIS';
+const FROM_ADDRESS = 'onboarding@resend.dev';
 
 // ============ FIREBASE ADMIN ============
 let firebaseAdmin = null;
@@ -240,7 +234,7 @@ app.post('/send-code', async (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
     return res.status(400).json({ ok: false, message: 'Неверный формат email' });
   }
-  if (!mailer) {
+  if (!resend) {
     return res.status(500).json({ ok: false, message: 'Почта не настроена на сервере' });
   }
 
@@ -268,11 +262,10 @@ app.post('/send-code', async (req, res) => {
     );
 
     // Отправляем письмо
-    await mailer.sendMail({
-      from: `"${FROM_NAME}" <${FROM_ADDRESS}>`,
+    const { error: emailError } = await resend.emails.send({
+      from: `${FROM_NAME} <${FROM_ADDRESS}>`,
       to: cleanEmail,
       subject: `${FROM_NAME} — код подтверждения`,
-      text: `Ваш код подтверждения: ${code}\n\nКод действует 10 минут.`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">
           <h2 style="color: #7C3AED; margin: 0 0 12px;">${FROM_NAME}</h2>
@@ -284,6 +277,11 @@ app.post('/send-code', async (req, res) => {
         </div>
       `,
     });
+
+    if (emailError) {
+      console.error('Resend error:', emailError);
+      return res.status(500).json({ ok: false, message: 'Не удалось отправить письмо' });
+    }
 
     console.log(`📧 Код для ${cleanEmail}: ${code}`);
     res.json({ ok: true, message: 'Код отправлен на почту' });
