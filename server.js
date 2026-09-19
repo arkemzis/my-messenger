@@ -7,6 +7,25 @@ const multer = require('multer');
 const { Server } = require('socket.io');
 const pool = require('./db');
 
+// ============ FIREBASE ADMIN ============
+let firebaseAdmin = null;
+try {
+  const admin = require('firebase-admin');
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (serviceAccountJson) {
+    const serviceAccount = JSON.parse(serviceAccountJson);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    firebaseAdmin = admin;
+    console.log('✅ Firebase Admin инициализирован');
+  } else {
+    console.log('⚠️ FIREBASE_SERVICE_ACCOUNT не задан — push-уведомления отключены');
+  }
+} catch (err) {
+  console.error('Ошибка Firebase Admin:', err.message);
+}
+
 async function initDatabase() {
   try {
     await pool.query(`
@@ -21,6 +40,7 @@ async function initDatabase() {
     `);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(100) DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT DEFAULT ''`);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
@@ -293,6 +313,23 @@ app.get('/public-key/:userId', async (req, res) => {
   }
 });
 
+
+// Сохранить FCM-токен пользователя (для push-уведомлений)
+app.post('/set-fcm-token', async (req, res) => {
+  const { userId, fcmToken } = req.body;
+  const uid = parseInt(userId) || req.session.userId;
+  if (!uid || !fcmToken) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+  try {
+    await pool.query('UPDATE users SET fcm_token = $1 WHERE id = $2', [fcmToken, uid]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('set-fcm-token error:', err.message);
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
 // ============ ГРУППЫ И КАНАЛЫ ============
 
 app.post('/create-group', async (req, res) => {
@@ -557,6 +594,36 @@ async function getReplyInfo(replyId) {
   }
 }
 
+// ============ PUSH-УВЕДОМЛЕНИЯ ============
+async function sendPushToUser(userId, title, body, data = {}) {
+  if (!firebaseAdmin) return;
+  try {
+    const result = await pool.query('SELECT fcm_token FROM users WHERE id = $1', [userId]);
+    if (result.rows.length === 0) return;
+    const token = result.rows[0].fcm_token;
+    if (!token) return;
+
+    await firebaseAdmin.messaging().send({
+      token: token,
+      notification: {
+        title: title,
+        body: body,
+      },
+      data: data,
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'arkzis_messages',
+          sound: 'default',
+        },
+      },
+    });
+  } catch (err) {
+    console.error('Push error:', err.message);
+  }
+}
+
+
 app.post('/send', async (req, res) => {
   const { to, text, from, imageUrl, chatId, replyToId,
           fileUrl, fileName, fileSize, fileType } = req.body;
@@ -625,6 +692,29 @@ app.post('/send', async (req, res) => {
         });
       }
 
+
+      // Push всем участникам кроме отправителя
+      try {
+        const chatNameRes = await pool.query('SELECT name FROM chats WHERE id = $1', [cid]);
+        const chatName = chatNameRes.rows[0]?.name || 'Чат';
+        const senderName = sender.name || sender.email || 'Кто-то';
+        let preview = textTrim;
+        if (!preview && imgUrl) preview = '📷 Фото';
+        if (!preview && fUrl) preview = '📎 Файл';
+        const pushTitle = chatName;
+        const pushBody = senderName + ': ' + preview;
+        for (const row of membersRes.rows) {
+          if (row.user_id !== fromUserId) {
+            sendPushToUser(
+              row.user_id,
+              pushTitle,
+              pushBody,
+              { type: 'message', chatId: cid.toString() }
+            );
+          }
+        }
+      } catch (e) {}
+
       return res.json({
         ok: true,
         id: result.rows[0].id,
@@ -669,6 +759,23 @@ app.post('/send', async (req, res) => {
       reactions: [],
       ...replyInfo,
     });
+
+    // Push получателю
+    try {
+      const senderRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [fromUserId]);
+      const sender = senderRes.rows[0] || {};
+      const senderName = sender.name || sender.email || 'Кто-то';
+      let preview = textTrim;
+      if (!preview && imgUrl) preview = '📷 Фото';
+      if (!preview && fUrl) preview = '📎 Файл';
+      sendPushToUser(
+        toUserId,
+        senderName,
+        preview,
+        { type: 'message', peerId: fromUserId.toString() }
+      );
+    } catch (e) {}
+
     res.json({
       ok: true,
       id: result.rows[0].id,
