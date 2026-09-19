@@ -38,6 +38,10 @@ async function initDatabase() {
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited BOOLEAN DEFAULT FALSE`);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER`);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_url TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_size BIGINT DEFAULT 0`);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_type TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE messages ALTER COLUMN text SET DEFAULT ''`);
     await pool.query(`ALTER TABLE messages ALTER COLUMN to_user DROP NOT NULL`);
 
@@ -82,6 +86,13 @@ async function initDatabase() {
       )
     `);
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS public_keys (
+        user_id INTEGER PRIMARY KEY,
+        public_key TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS hidden_chats (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
@@ -90,20 +101,13 @@ async function initDatabase() {
         UNIQUE(user_id, peer_id)
       )
     `);
-        await pool.query(`
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS hidden_chat_groups (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
         chat_id INTEGER NOT NULL,
         hidden_at TIMESTAMP DEFAULT NOW(),
         UNIQUE(user_id, chat_id)
-      )
-    `);
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS public_keys (
-        user_id INTEGER PRIMARY KEY,
-        public_key TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT NOW()
       )
     `);
     console.log('✅ Таблицы готовы');
@@ -143,6 +147,7 @@ const storage = multer.diskStorage({
   },
 });
 const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
+const uploadFile = multer({ storage, limits: { fileSize: 25 * 1024 * 1024 } });
 
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
@@ -237,6 +242,7 @@ app.get('/users', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT u.id, u.email, u.name, u.avatar_url, pk.public_key,
+             hc.hidden_at,
              (SELECT COUNT(*) FROM messages m
               WHERE m.chat_id IS NULL
                 AND m.from_user = u.id
@@ -244,6 +250,7 @@ app.get('/users', async (req, res) => {
                 AND m.read_at IS NULL) AS unread_count
       FROM users u
       LEFT JOIN public_keys pk ON pk.user_id = u.id
+      LEFT JOIN hidden_chats hc ON hc.user_id = $1 AND hc.peer_id = u.id
       ORDER BY u.id
     `, [myId]);
     const users = result.rows.map(u => ({ ...u, online: onlineUsers.has(u.id) }));
@@ -344,6 +351,7 @@ app.get('/my-chats', async (req, res) => {
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
+
 app.get('/all-channels', async (req, res) => {
   try {
     const result = await pool.query(
@@ -450,8 +458,10 @@ app.get('/messages', async (req, res) => {
         `SELECT
            m.id, m.from_user, m.to_user, m.chat_id, m.text, m.image_url, m.created_at,
            m.edited, m.reply_to_id, m.read_at,
+           m.file_url, m.file_name, m.file_size, m.file_type,
            u.name AS sender_name, u.email AS sender_email, u.avatar_url AS sender_avatar,
            rm.text AS reply_text, rm.image_url AS reply_image_url, rm.from_user AS reply_from_user,
+           rm.file_url AS reply_file_url, rm.file_name AS reply_file_name,
            ru.name AS reply_sender_name, ru.email AS reply_sender_email,
            COALESCE(
              (SELECT json_agg(json_build_object('user_id', r.user_id, 'emoji', r.emoji))
@@ -471,7 +481,9 @@ app.get('/messages', async (req, res) => {
         `SELECT
            m.id, m.from_user, m.to_user, m.chat_id, m.text, m.image_url, m.created_at,
            m.edited, m.reply_to_id, m.read_at,
+           m.file_url, m.file_name, m.file_size, m.file_type,
            rm.text AS reply_text, rm.image_url AS reply_image_url, rm.from_user AS reply_from_user,
+           rm.file_url AS reply_file_url, rm.file_name AS reply_file_name,
            ru.name AS reply_sender_name, ru.email AS reply_sender_email,
            COALESCE(
              (SELECT json_agg(json_build_object('user_id', r.user_id, 'emoji', r.emoji))
@@ -504,12 +516,26 @@ app.post('/upload', upload.single('image'), async (req, res) => {
   res.json({ ok: true, imageUrl });
 });
 
+app.post('/upload-file', uploadFile.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, message: 'Файл не загружен' });
+  const fileUrl = '/uploads/' + req.file.filename;
+  const originalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+  res.json({
+    ok: true,
+    fileUrl,
+    fileName: originalName,
+    fileSize: req.file.size,
+    fileType: req.file.mimetype,
+  });
+});
+
 // Вспомогательная функция: получить инфо об оригинале (для цитаты)
 async function getReplyInfo(replyId) {
   if (!replyId) return {};
   try {
     const r = await pool.query(
-      `SELECT m.text, m.image_url, m.from_user, u.name, u.email
+      `SELECT m.text, m.image_url, m.from_user, m.file_url, m.file_name,
+              u.name, u.email
        FROM messages m
        LEFT JOIN users u ON u.id = m.from_user
        WHERE m.id = $1`,
@@ -520,6 +546,8 @@ async function getReplyInfo(replyId) {
       reply_to_id: replyId,
       reply_text: r.rows[0].text,
       reply_image_url: r.rows[0].image_url,
+      reply_file_url: r.rows[0].file_url,
+      reply_file_name: r.rows[0].file_name,
       reply_from_user: r.rows[0].from_user,
       reply_sender_name: r.rows[0].name || r.rows[0].email,
       reply_sender_email: r.rows[0].email,
@@ -530,15 +558,20 @@ async function getReplyInfo(replyId) {
 }
 
 app.post('/send', async (req, res) => {
-  const { to, text, from, imageUrl, chatId, replyToId } = req.body;
+  const { to, text, from, imageUrl, chatId, replyToId,
+          fileUrl, fileName, fileSize, fileType } = req.body;
   const fromUserId = parseInt(from) || req.session.userId;
   const toUserId = parseInt(to);
   const cid = parseInt(chatId);
   const replyId = parseInt(replyToId) || null;
   const textTrim = (text || '').trim();
   const imgUrl = (imageUrl || '').trim();
+  const fUrl = (fileUrl || '').trim();
+  const fName = (fileName || '').trim();
+  const fSize = parseInt(fileSize) || 0;
+  const fType = (fileType || '').trim();
 
-  if (!fromUserId || (!textTrim && !imgUrl)) {
+  if (!fromUserId || (!textTrim && !imgUrl && !fUrl)) {
     return res.status(400).json({ ok: false, message: 'Не хватает данных' });
   }
 
@@ -557,8 +590,11 @@ app.post('/send', async (req, res) => {
       }
 
       const result = await pool.query(
-        'INSERT INTO messages (from_user, chat_id, text, image_url, reply_to_id) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at',
-        [fromUserId, cid, textTrim, imgUrl, replyId]
+        `INSERT INTO messages
+           (from_user, chat_id, text, image_url, reply_to_id, file_url, file_name, file_size, file_type)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id, created_at`,
+        [fromUserId, cid, textTrim, imgUrl, replyId, fUrl, fName, fSize, fType]
       );
 
       const userRes = await pool.query('SELECT name, email, avatar_url FROM users WHERE id = $1', [fromUserId]);
@@ -574,6 +610,10 @@ app.post('/send', async (req, res) => {
           chat_id: cid,
           text: textTrim,
           image_url: imgUrl,
+          file_url: fUrl,
+          file_name: fName,
+          file_size: fSize,
+          file_type: fType,
           created_at: result.rows[0].created_at,
           edited: false,
           read_at: null,
@@ -585,7 +625,13 @@ app.post('/send', async (req, res) => {
         });
       }
 
-      return res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at, read_at: null, ...replyInfo });
+      return res.json({
+        ok: true,
+        id: result.rows[0].id,
+        created_at: result.rows[0].created_at,
+        read_at: null,
+        ...replyInfo,
+      });
     } catch (err) {
       console.error('Ошибка базы:', err.message);
       return res.status(500).json({ ok: false, message: 'Ошибка сервера' });
@@ -597,8 +643,11 @@ app.post('/send', async (req, res) => {
 
   try {
     const result = await pool.query(
-      'INSERT INTO messages (from_user, to_user, text, image_url, reply_to_id) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at',
-      [fromUserId, toUserId, textTrim, imgUrl, replyId]
+      `INSERT INTO messages
+         (from_user, to_user, text, image_url, reply_to_id, file_url, file_name, file_size, file_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, created_at`,
+      [fromUserId, toUserId, textTrim, imgUrl, replyId, fUrl, fName, fSize, fType]
     );
 
     const replyInfo = await getReplyInfo(replyId);
@@ -610,13 +659,23 @@ app.post('/send', async (req, res) => {
       chat_id: null,
       text: textTrim,
       image_url: imgUrl,
+      file_url: fUrl,
+      file_name: fName,
+      file_size: fSize,
+      file_type: fType,
       created_at: result.rows[0].created_at,
       edited: false,
       read_at: null,
       reactions: [],
       ...replyInfo,
     });
-    res.json({ ok: true, id: result.rows[0].id, created_at: result.rows[0].created_at, read_at: null, ...replyInfo });
+    res.json({
+      ok: true,
+      id: result.rows[0].id,
+      created_at: result.rows[0].created_at,
+      read_at: null,
+      ...replyInfo,
+    });
   } catch (err) {
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
@@ -714,13 +773,21 @@ app.delete('/messages/:id', async (req, res) => {
   const userId = parseInt(req.query.userId) || req.session.userId;
   if (!messageId || !userId) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
   try {
-    const check = await pool.query('SELECT from_user, to_user, chat_id, image_url FROM messages WHERE id = $1', [messageId]);
+    const check = await pool.query(
+      'SELECT from_user, to_user, chat_id, image_url, file_url FROM messages WHERE id = $1',
+      [messageId]
+    );
     if (check.rows.length === 0) return res.status(404).json({ ok: false, message: 'Сообщение не найдено' });
     if (check.rows[0].from_user !== userId) return res.status(403).json({ ok: false, message: 'Можно удалять только свои' });
 
     const imgUrl = check.rows[0].image_url;
     if (imgUrl && imgUrl.startsWith('/uploads/')) {
       const filename = imgUrl.replace('/uploads/', '');
+      fs.unlink(path.join(uploadsDir, filename), () => {});
+    }
+    const fUrl = check.rows[0].file_url;
+    if (fUrl && fUrl.startsWith('/uploads/')) {
+      const filename = fUrl.replace('/uploads/', '');
       fs.unlink(path.join(uploadsDir, filename), () => {});
     }
 
@@ -787,7 +854,9 @@ app.post('/react', async (req, res) => {
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
-// Скрыть чат у себя (для личных и групп)
+
+// ============ СКРЫТИЕ / УДАЛЕНИЕ ЧАТОВ ============
+
 app.post('/hide-chat', async (req, res) => {
   const { userId, peerId, chatId } = req.body;
   const uid = parseInt(userId) || req.session.userId;
@@ -821,7 +890,6 @@ app.post('/hide-chat', async (req, res) => {
   }
 });
 
-// Удалить чат для всех (личка: удалить переписку у обоих; группа: только админ)
 app.post('/delete-chat-for-all', async (req, res) => {
   const { userId, peerId, chatId } = req.body;
   const uid = parseInt(userId) || req.session.userId;
@@ -834,7 +902,6 @@ app.post('/delete-chat-for-all', async (req, res) => {
 
   try {
     if (cid) {
-      // Группа — только создатель может удалить для всех
       const chatInfo = await pool.query('SELECT created_by FROM chats WHERE id = $1', [cid]);
       if (chatInfo.rows.length === 0) {
         return res.status(404).json({ ok: false, message: 'Чат не найден' });
@@ -843,21 +910,21 @@ app.post('/delete-chat-for-all', async (req, res) => {
         return res.status(403).json({ ok: false, message: 'Только админ может удалить для всех' });
       }
 
-      // Удалить все сообщения группы + вложения
       const imagesRes = await pool.query(
-        `SELECT image_url FROM messages WHERE chat_id = $1 AND image_url != ''`,
+        `SELECT image_url, file_url FROM messages WHERE chat_id = $1`,
         [cid]
       );
       for (const row of imagesRes.rows) {
         if (row.image_url && row.image_url.startsWith('/uploads/')) {
-          const filename = row.image_url.replace('/uploads/', '');
-          fs.unlink(path.join(uploadsDir, filename), () => {});
+          fs.unlink(path.join(uploadsDir, row.image_url.replace('/uploads/', '')), () => {});
+        }
+        if (row.file_url && row.file_url.startsWith('/uploads/')) {
+          fs.unlink(path.join(uploadsDir, row.file_url.replace('/uploads/', '')), () => {});
         }
       }
       await pool.query('DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE chat_id = $1)', [cid]);
       await pool.query('DELETE FROM messages WHERE chat_id = $1', [cid]);
 
-      // Оповестить всех участников
       const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [cid]);
       for (const row of membersRes.rows) {
         io.to('user_' + row.user_id).emit('chat_deleted', { chatId: cid, forAll: true });
@@ -866,18 +933,18 @@ app.post('/delete-chat-for-all', async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // Личка — удалить переписку у обоих
     const imagesRes = await pool.query(
-      `SELECT image_url FROM messages
+      `SELECT image_url, file_url FROM messages
        WHERE chat_id IS NULL
-         AND ((from_user = $1 AND to_user = $2) OR (from_user = $2 AND to_user = $1))
-         AND image_url != ''`,
+         AND ((from_user = $1 AND to_user = $2) OR (from_user = $2 AND to_user = $1))`,
       [uid, peer]
     );
     for (const row of imagesRes.rows) {
       if (row.image_url && row.image_url.startsWith('/uploads/')) {
-        const filename = row.image_url.replace('/uploads/', '');
-        fs.unlink(path.join(uploadsDir, filename), () => {});
+        fs.unlink(path.join(uploadsDir, row.image_url.replace('/uploads/', '')), () => {});
+      }
+      if (row.file_url && row.file_url.startsWith('/uploads/')) {
+        fs.unlink(path.join(uploadsDir, row.file_url.replace('/uploads/', '')), () => {});
       }
     }
     await pool.query(
@@ -895,7 +962,6 @@ app.post('/delete-chat-for-all', async (req, res) => {
       [uid, peer]
     );
 
-    // Оповестить обоих
     io.to('user_' + peer).emit('chat_deleted', { peerId: uid, forAll: true });
     io.to('user_' + uid).emit('chat_deleted', { peerId: peer, forAll: true });
 
