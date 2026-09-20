@@ -921,10 +921,10 @@ app.post('/send', async (req, res) => {
         const chatName = chatNameRes.rows[0]?.name || 'Чат';
         const senderName = sender.username || 'Пользователь';
         let preview = textTrim;
-        if (preview.startsWith('E2EE:')) preview = '🔒 Зашифрованное сообщение';
+        if (preview.startsWith('E2EE:')) preview = 'Новое сообщение';
         if (!preview && imgUrl) preview = '📷 Фото';
         if (!preview && fUrl) preview = '📎 Файл';
-        const pushTitle = chatName;
+        const pushTitle = '💬 ' + chatName;
         const pushBody = senderName + ': ' + preview;
         for (const row of membersRes.rows) {
           if (row.user_id !== fromUserId) {
@@ -989,12 +989,12 @@ app.post('/send', async (req, res) => {
       const sender = senderRes.rows[0] || {};
       const senderName = sender.username || 'Пользователь';
       let preview = textTrim;
-      if (preview.startsWith('E2EE:')) preview = '🔒 Зашифрованное сообщение';
+      if (preview.startsWith('E2EE:')) preview = 'Новое сообщение';
       if (!preview && imgUrl) preview = '📷 Фото';
       if (!preview && fUrl) preview = '📎 Файл';
       sendPushToUser(
         toUserId,
-        senderName,
+        '💬 ' + senderName,
         preview,
         { type: 'message', peerId: fromUserId.toString() }
       );
