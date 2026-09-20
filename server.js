@@ -234,9 +234,7 @@ app.post('/send-code', async (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
     return res.status(400).json({ ok: false, message: 'Неверный формат email' });
   }
-  if (!resend) {
-    return res.status(500).json({ ok: false, message: 'Почта не настроена на сервере' });
-  }
+  // ВРЕМЕННО ДЛЯ БЕТЫ: Resend не обязателен, код возвращается прямо
 
   try {
     // Проверяем, не занят ли уже
@@ -261,7 +259,8 @@ app.post('/send-code', async (req, res) => {
       [cleanEmail, code, expiresAt]
     );
 
-    // Отправляем письмо
+    // ВРЕМЕННО ДЛЯ БЕТЫ: письмо не отправляем
+    if (false) {
     const { error: emailError } = await resend.emails.send({
       from: `${FROM_NAME} <${FROM_ADDRESS}>`,
       to: cleanEmail,
@@ -283,8 +282,9 @@ app.post('/send-code', async (req, res) => {
       return res.status(500).json({ ok: false, message: 'Не удалось отправить письмо' });
     }
 
+    }
     console.log(`📧 Код для ${cleanEmail}: ${code}`);
-    res.json({ ok: true, message: 'Код отправлен на почту' });
+    res.json({ ok: true, message: 'Код сгенерирован', code: code, beta: true });
   } catch (err) {
     console.error('send-code error:', err.message);
     res.status(500).json({ ok: false, message: 'Не удалось отправить код' });
