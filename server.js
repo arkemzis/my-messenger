@@ -453,7 +453,17 @@ app.get('/users', async (req, res) => {
              (SELECT MAX(m.created_at) FROM messages m
               WHERE m.chat_id IS NULL
                 AND ((m.from_user = u.id AND m.to_user = $1)
-                  OR (m.from_user = $1 AND m.to_user = u.id))) AS last_msg_at
+                  OR (m.from_user = $1 AND m.to_user = u.id))) AS last_msg_at,
+             (SELECT m.text FROM messages m
+              WHERE m.chat_id IS NULL
+                AND ((m.from_user = u.id AND m.to_user = $1)
+                  OR (m.from_user = $1 AND m.to_user = u.id))
+              ORDER BY m.created_at DESC LIMIT 1) AS last_msg_text,
+             (SELECT m.image_url FROM messages m
+              WHERE m.chat_id IS NULL
+                AND ((m.from_user = u.id AND m.to_user = $1)
+                  OR (m.from_user = $1 AND m.to_user = u.id))
+              ORDER BY m.created_at DESC LIMIT 1) AS last_msg_img
       FROM users u
       LEFT JOIN public_keys pk ON pk.user_id = u.id
       LEFT JOIN hidden_chats hc ON hc.user_id = $1 AND hc.peer_id = u.id
