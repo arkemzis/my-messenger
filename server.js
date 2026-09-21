@@ -1383,6 +1383,70 @@ io.on('connection', (socket) => {
     socket.emit('online_list', getOnlineIds());
   });
 
+  // ============ SIGNALING ДЛЯ ЗВОНКОВ ============
+  socket.on('call:invite', (data) => {
+    if (!data || !socket.userId) return;
+    const { to, callType } = data;
+    if (!to) return;
+    console.log(`📞 Звонок: ${socket.userId} → ${to} (${callType || 'audio'})`);
+    io.to('user_' + to).emit('call:incoming', {
+      from: socket.userId,
+      callType: callType || 'audio',
+    });
+  });
+
+  socket.on('call:accept', (data) => {
+    if (!data || !socket.userId) return;
+    io.to('user_' + data.to).emit('call:accepted', {
+      from: socket.userId,
+    });
+  });
+
+  socket.on('call:reject', (data) => {
+    if (!data || !socket.userId) return;
+    io.to('user_' + data.to).emit('call:rejected', {
+      from: socket.userId,
+    });
+  });
+
+  socket.on('call:offer', (data) => {
+    if (!data || !socket.userId) return;
+    io.to('user_' + data.to).emit('call:offer', {
+      from: socket.userId,
+      sdp: data.sdp,
+    });
+  });
+
+  socket.on('call:answer', (data) => {
+    if (!data || !socket.userId) return;
+    io.to('user_' + data.to).emit('call:answer', {
+      from: socket.userId,
+      sdp: data.sdp,
+    });
+  });
+
+  socket.on('call:ice', (data) => {
+    if (!data || !socket.userId) return;
+    io.to('user_' + data.to).emit('call:ice', {
+      from: socket.userId,
+      candidate: data.candidate,
+    });
+  });
+
+  socket.on('call:end', (data) => {
+    if (!data || !socket.userId) return;
+    io.to('user_' + data.to).emit('call:ended', {
+      from: socket.userId,
+    });
+  });
+
+  socket.on('call:busy', (data) => {
+    if (!data || !socket.userId) return;
+    io.to('user_' + data.to).emit('call:busy', {
+      from: socket.userId,
+    });
+  });
+
   socket.on('typing', (data) => {
     if (!data || !socket.userId) return;
     if (data.chatId) {
