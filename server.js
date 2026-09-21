@@ -828,6 +828,45 @@ async function getReplyInfo(replyId) {
 }
 
 // ============ PUSH-УВЕДОМЛЕНИЯ ============
+async function sendCallPush(userId, callerId, callerName, callType) {
+  if (!firebaseAdmin) return;
+  try {
+    const result = await pool.query('SELECT fcm_token FROM users WHERE id = $1', [userId]);
+    if (result.rows.length === 0) return;
+    const token = result.rows[0].fcm_token;
+    if (!token) return;
+
+    // data-only push — чтобы клиент сам показал CallKit
+    await firebaseAdmin.messaging().send({
+      token: token,
+      data: {
+        type: 'call',
+        callerId: String(callerId),
+        callerName: String(callerName || 'Пользователь'),
+        callType: String(callType || 'audio'),
+      },
+      android: {
+        priority: 'high',
+        ttl: 30000,
+      },
+      apns: {
+        headers: {
+          'apns-priority': '10',
+          'apns-push-type': 'voip',
+        },
+        payload: {
+          aps: {
+            'content-available': 1,
+          },
+        },
+      },
+    });
+    console.log(`📲 Call push → ${userId} (от ${callerName})`);
+  } catch (e) {
+    console.error('Call push error:', e.message);
+  }
+}
+
 async function sendPushToUser(userId, title, body, data = {}) {
   if (!firebaseAdmin) return;
   try {
@@ -1384,7 +1423,7 @@ io.on('connection', (socket) => {
   });
 
   // ============ SIGNALING ДЛЯ ЗВОНКОВ ============
-  socket.on('call:invite', (data) => {
+  socket.on('call:invite', async (data) => {
     if (!data || !socket.userId) return;
     const { to, callType } = data;
     if (!to) return;
@@ -1393,6 +1432,15 @@ io.on('connection', (socket) => {
       from: socket.userId,
       callType: callType || 'audio',
     });
+
+    // FCM push — для случая, когда приложение закрыто
+    try {
+      const userRes = await pool.query('SELECT username FROM users WHERE id = $1', [socket.userId]);
+      const callerName = userRes.rows[0]?.username || `Пользователь #${socket.userId}`;
+      await sendCallPush(to, socket.userId, callerName, callType || 'audio');
+    } catch (e) {
+      console.error('call:invite push error:', e.message);
+    }
   });
 
   socket.on('call:accept', (data) => {
