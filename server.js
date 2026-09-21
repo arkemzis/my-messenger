@@ -6,23 +6,26 @@ const http = require('http');
 const multer = require('multer');
 const { Server } = require('socket.io');
 const pool = require('./db');
-const { Resend } = require('resend');
+const Mailjet = require('node-mailjet');
 
-// ============ EMAIL (Resend) ============
-let resend = null;
+// ============ EMAIL (Mailjet) ============
+let mailjet = null;
 try {
-  if (process.env.RESEND_API_KEY) {
-    resend = new Resend(process.env.RESEND_API_KEY);
-    console.log('✅ Resend готов');
+  if (process.env.MAILJET_API_KEY && process.env.MAILJET_SECRET_KEY) {
+    mailjet = Mailjet.apiConnect(
+      process.env.MAILJET_API_KEY,
+      process.env.MAILJET_SECRET_KEY
+    );
+    console.log('✅ Mailjet готов');
   } else {
-    console.log('⚠️ RESEND_API_KEY не задан');
+    console.log('⚠️ MAILJET_API_KEY или MAILJET_SECRET_KEY не задан');
   }
 } catch (err) {
-  console.error('Ошибка инициализации Resend:', err.message);
+  console.error('Ошибка инициализации Mailjet:', err.message);
 }
 
 const FROM_NAME = 'ARKZIS';
-const FROM_ADDRESS = 'onboarding@resend.dev';
+const FROM_ADDRESS = 'arkzis.messnger@gmail.com';
 
 // ============ FIREBASE ADMIN ============
 let firebaseAdmin = null;
@@ -260,28 +263,32 @@ app.post('/send-code', async (req, res) => {
     );
 
     // ВРЕМЕННО ДЛЯ БЕТЫ: письмо не отправляем
-    if (false) {
-    const { error: emailError } = await resend.emails.send({
-      from: `${FROM_NAME} <${FROM_ADDRESS}>`,
-      to: cleanEmail,
-      subject: `${FROM_NAME} — код подтверждения`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">
-          <h2 style="color: #7C3AED; margin: 0 0 12px;">${FROM_NAME}</h2>
-          <p style="font-size: 15px; color: #333;">Ваш код подтверждения:</p>
-          <div style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #7C3AED; padding: 16px; background: #F3E8FF; border-radius: 8px; text-align: center; margin: 16px 0;">
-            ${code}
-          </div>
-          <p style="font-size: 13px; color: #666;">Код действует 10 минут. Если вы не регистрировались — просто проигнорируйте это письмо.</p>
-        </div>
-      `,
-    });
-
-    if (emailError) {
-      console.error('Resend error:', emailError);
-      return res.status(500).json({ ok: false, message: 'Не удалось отправить письмо' });
-    }
-
+    try {
+      if (mailjet) {
+        await mailjet.post('send', { version: 'v3.1' }).request({
+          Messages: [{
+            From: { Email: FROM_ADDRESS, Name: FROM_NAME },
+            To: [{ Email: cleanEmail }],
+            Subject: `${FROM_NAME} — код подтверждения`,
+            HTMLPart: `
+              <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">
+                <h2 style="color: #7C3AED; margin: 0 0 12px;">${FROM_NAME}</h2>
+                <p style="font-size: 15px; color: #333;">Ваш код подтверждения:</p>
+                <div style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #7C3AED; padding: 16px; background: #F3E8FF; border-radius: 8px; text-align: center; margin: 16px 0;">
+                  ${code}
+                </div>
+                <p style="font-size: 13px; color: #666;">Код действует 10 минут. Если вы не регистрировались — просто проигнорируйте это письмо.</p>
+              </div>
+            `,
+          }],
+        });
+        console.log('✅ Письмо отправлено через Mailjet:', cleanEmail);
+      } else {
+        console.log('⚠️ Mailjet не настроен, письмо не отправлено');
+      }
+    } catch (emailErr) {
+      console.error('Mailjet error:', emailErr.message);
+      // Не роняем регистрацию — код всё равно вернётся в ответе
     }
     console.log(`📧 Код для ${cleanEmail}: ${code}`);
     res.json({ ok: true, message: 'Код сгенерирован', code: code, beta: true });
@@ -678,15 +685,19 @@ app.post('/join-channel', async (req, res) => {
 });
 
 app.post('/add-member', async (req, res) => {
-  const { chatId, userId } = req.body;
+  const { chatId, userId, requesterId } = req.body;
   const cid = parseInt(chatId);
-  const uid = parseInt(userId);
+  const rid = parseInt(requesterId);
   if (!cid || !uid) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
 
   try {
-    const chatInfo = await pool.query('SELECT is_channel FROM chats WHERE id = $1', [cid]);
+    const chatInfo = await pool.query('SELECT is_channel, created_by FROM chats WHERE id = $1', [cid]);
     if (chatInfo.rows[0]?.is_channel) {
       return res.status(400).json({ ok: false, message: 'В канал нельзя добавить — только подписка' });
+    }
+
+    if (chatInfo.rows[0]?.created_by !== rid) {
+      return res.status(403).json({ ok: false, message: 'Только админ может добавлять' });
     }
 
     await pool.query(
