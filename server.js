@@ -828,7 +828,7 @@ async function getReplyInfo(replyId) {
 }
 
 // ============ PUSH-УВЕДОМЛЕНИЯ ============
-async function sendCallPush(userId, callerId, callerName, callType) {
+async function sendCallPush(userId, callerId, callerName, callType, callerAvatar = '') {
   if (!firebaseAdmin) return;
   try {
     const result = await pool.query('SELECT fcm_token FROM users WHERE id = $1', [userId]);
@@ -843,6 +843,7 @@ async function sendCallPush(userId, callerId, callerName, callType) {
         type: 'call',
         callerId: String(callerId),
         callerName: String(callerName || 'Пользователь'),
+        callerAvatar: String(callerAvatar || ''),
         callType: String(callType || 'audio'),
       },
       android: {
@@ -895,6 +896,39 @@ async function sendPushToUser(userId, title, body, data = {}) {
   }
 }
 
+
+// HTTP-фолбэк для отклонения звонка (работает без socket)
+app.post('/call-reject', (req, res) => {
+  const { from, to } = req.body || {};
+  const fromId = parseInt(from);
+  const toId = parseInt(to);
+  if (!fromId || !toId) return res.status(400).json({ ok: false });
+  console.log(`❌ Отклонён: ${fromId} ← ${toId}`);
+  io.to('user_' + toId).emit('call:rejected', { from: fromId });
+  res.json({ ok: true });
+});
+
+// HTTP-фолбэк для завершения звонка
+app.post('/call-end', (req, res) => {
+  const { from, to } = req.body || {};
+  const fromId = parseInt(from);
+  const toId = parseInt(to);
+  if (!fromId || !toId) return res.status(400).json({ ok: false });
+  console.log(`🔚 Завершён: ${fromId} ← ${toId}`);
+  io.to('user_' + toId).emit('call:ended', { from: fromId });
+  res.json({ ok: true });
+});
+
+// HTTP-фолбэк для принятия звонка (если socket не подписан)
+app.post('/call-accept', (req, res) => {
+  const { from, to } = req.body || {};
+  const fromId = parseInt(from);
+  const toId = parseInt(to);
+  if (!fromId || !toId) return res.status(400).json({ ok: false });
+  console.log(`✅ Принят: ${fromId} → ${toId}`);
+  io.to('user_' + toId).emit('call:accepted', { from: fromId });
+  res.json({ ok: true });
+});
 
 app.post('/send', async (req, res) => {
   const { to, text, from, imageUrl, chatId, replyToId,
@@ -1428,16 +1462,28 @@ io.on('connection', (socket) => {
     const { to, callType } = data;
     if (!to) return;
     console.log(`📞 Звонок: ${socket.userId} → ${to} (${callType || 'audio'})`);
+
+    // Достаём имя и аватар звонящего
+    let callerName = `Пользователь #${socket.userId}`;
+    let callerAvatar = '';
+    try {
+      const userRes = await pool.query('SELECT username, avatar_url FROM users WHERE id = $1', [socket.userId]);
+      if (userRes.rows.length > 0) {
+        callerName = userRes.rows[0].username || callerName;
+        callerAvatar = userRes.rows[0].avatar_url || '';
+      }
+    } catch (_) {}
+
     io.to('user_' + to).emit('call:incoming', {
       from: socket.userId,
       callType: callType || 'audio',
+      callerName: callerName,
+      callerAvatar: callerAvatar,
     });
 
     // FCM push — для случая, когда приложение закрыто
     try {
-      const userRes = await pool.query('SELECT username FROM users WHERE id = $1', [socket.userId]);
-      const callerName = userRes.rows[0]?.username || `Пользователь #${socket.userId}`;
-      await sendCallPush(to, socket.userId, callerName, callType || 'audio');
+      await sendCallPush(to, socket.userId, callerName, callType || 'audio', callerAvatar);
     } catch (e) {
       console.error('call:invite push error:', e.message);
     }
@@ -1453,6 +1499,13 @@ io.on('connection', (socket) => {
   socket.on('call:reject', (data) => {
     if (!data || !socket.userId) return;
     io.to('user_' + data.to).emit('call:rejected', {
+      from: socket.userId,
+    });
+  });
+
+  socket.on('call:end', (data) => {
+    if (!data || !socket.userId) return;
+    io.to('user_' + data.to).emit('call:ended', {
       from: socket.userId,
     });
   });
