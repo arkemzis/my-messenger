@@ -943,6 +943,41 @@ app.get('/app-version', (req, res) => {
   });
 });
 
+// ============ PUSH-РАССЫЛКА ВСЕМ ============
+const BROADCAST_SECRET = 'ARKZIS_ARTEM_2026';  // 🔐 поменяй если хочешь
+
+app.post('/broadcast', async (req, res) => {
+  const { secret, title, body } = req.body || {};
+  if (secret !== BROADCAST_SECRET) {
+    return res.status(403).json({ ok: false, message: 'Нет доступа' });
+  }
+  if (!title || !body) {
+    return res.status(400).json({ ok: false, message: 'Нужны title и body' });
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT id FROM users WHERE fcm_token IS NOT NULL AND fcm_token != ''"
+    );
+    const userIds = result.rows.map((r) => r.id);
+
+    console.log(`📢 Broadcast: ${title} — ${userIds.length} юзеров`);
+
+    let sent = 0;
+    for (const uid of userIds) {
+      try {
+        await sendPushToUser(uid, title, body, { type: 'broadcast' });
+        sent++;
+      } catch (_) {}
+    }
+
+    res.json({ ok: true, sent, total: userIds.length });
+  } catch (err) {
+    console.error('Broadcast error:', err.message);
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
 app.post('/send', async (req, res) => {
   const { to, text, from, imageUrl, chatId, replyToId,
           fileUrl, fileName, fileSize, fileType } = req.body;
