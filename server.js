@@ -930,6 +930,19 @@ app.post('/call-accept', (req, res) => {
   res.json({ ok: true });
 });
 
+// ============ ВЕРСИЯ ПРИЛОЖЕНИЯ ============
+const LATEST_APP_VERSION = '0.4.0';  // ⚠️ меняй тут при каждом релизе!
+const LATEST_APK_URL = 'https://github.com/arkemzis/arkzis/releases/latest';
+
+app.get('/app-version', (req, res) => {
+  res.json({
+    ok: true,
+    latest: LATEST_APP_VERSION,
+    downloadUrl: LATEST_APK_URL,
+    forceUpdate: false,
+  });
+});
+
 app.post('/send', async (req, res) => {
   const { to, text, from, imageUrl, chatId, replyToId,
           fileUrl, fileName, fileSize, fileType } = req.body;
