@@ -68,6 +68,7 @@ async function initDatabase() {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_claim TIMESTAMP`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sparks BIGINT DEFAULT 0`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS clicker_level INTEGER DEFAULT 1`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP`);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
@@ -455,7 +456,7 @@ app.get('/users', async (req, res) => {
   const myId = parseInt(req.query.me) || req.session.userId || 0;
   try {
     const result = await pool.query(`
-      SELECT u.id, u.username, u.avatar_url, pk.public_key,
+      SELECT u.id, u.username, u.avatar_url, pk.public_key, u.last_seen,
              hc.hidden_at,
              (SELECT COUNT(*) FROM messages m
               WHERE m.chat_id IS NULL
@@ -1907,6 +1908,7 @@ io.on('connection', (socket) => {
       if (arr.length === 0) {
         onlineUsers.delete(uid);
         io.emit('user_offline', { userId: uid });
+        pool.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [uid]).catch(() => {});
       } else {
         onlineUsers.set(uid, arr);
       }
