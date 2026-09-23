@@ -1640,6 +1640,45 @@ app.post('/debug-add-money', async (req, res) => {
   res.json({ ok: true, money: r.rows[0]?.money });
 });
 
+app.get('/my-gifts', async (req, res) => {
+  const userId = parseInt(req.query.userId) || req.session.userId;
+  if (!userId) return res.status(400).json({ ok: false });
+  try {
+    const received = await pool.query(
+      `SELECT file_url AS gift_id, COUNT(*) AS cnt
+       FROM messages
+       WHERE file_type = 'gift' AND to_user = $1
+       GROUP BY file_url`,
+      [userId]
+    );
+    const sent = await pool.query(
+      `SELECT file_url AS gift_id, COUNT(*) AS cnt
+       FROM messages
+       WHERE file_type = 'gift' AND from_user = $1
+       GROUP BY file_url`,
+      [userId]
+    );
+    const fmt = (rows) => {
+      const out = {};
+      for (const r of rows.rows) {
+        const id = r.gift_id;
+        if (!id) continue;
+        const meta = GIFTS[id] || {};
+        out[id] = {
+          count: parseInt(r.cnt),
+          name: meta.name || id,
+          emoji: meta.emoji || '🎁',
+          price: meta.price || 0,
+        };
+      }
+      return out;
+    };
+    res.json({ ok: true, received: fmt(received), sent: fmt(sent) });
+  } catch (err) {
+    res.status(500).json({ ok: false });
+  }
+});
+
 app.get('/gifts-catalog', async (req, res) => {
   try {
     const r = await pool.query(`SELECT COUNT(*) AS cnt FROM messages WHERE file_type = 'gift' AND file_url = 'pustota'`);
