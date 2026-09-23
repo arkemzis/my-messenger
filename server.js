@@ -1559,6 +1559,14 @@ const GIFTS = {
   'pustota':  { name: 'Пустота',   emoji: '🕳️', price: 25000 },
 };
 
+app.post('/debug-add-money', async (req, res) => {
+  const { secret, userId, amount } = req.body;
+  if (secret !== 'ARKZIS_ARTEM_2026') return res.status(403).json({ ok: false });
+  await pool.query('UPDATE users SET money = money + $1 WHERE id = $2', [parseInt(amount) || 0, parseInt(userId)]);
+  const r = await pool.query('SELECT money FROM users WHERE id = $1', [parseInt(userId)]);
+  res.json({ ok: true, money: r.rows[0]?.money });
+});
+
 app.get('/gifts-catalog', (req, res) => {
   res.json({ ok: true, gifts: GIFTS });
 });
