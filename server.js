@@ -1782,6 +1782,7 @@ io.on('connection', (socket) => {
     if (!onlineUsers.has(uid)) onlineUsers.set(uid, []);
     onlineUsers.get(uid).push(socket.id);
     io.emit('user_online', { userId: uid });
+    pool.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [uid]).catch(() => {});
     socket.emit('online_list', getOnlineIds());
   });
 
