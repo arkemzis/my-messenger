@@ -66,6 +66,8 @@ async function initDatabase() {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS money INTEGER DEFAULT 0`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_streak INTEGER DEFAULT 0`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_claim TIMESTAMP`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sparks BIGINT DEFAULT 0`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS clicker_level INTEGER DEFAULT 1`);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
@@ -1504,6 +1506,77 @@ app.get('/balance', async (req, res) => {
     res.json({ ok: true, ...r.rows[0] });
   } catch (err) {
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+app.get('/sparks', async (req, res) => {
+  const userId = parseInt(req.query.userId) || req.session.userId;
+  if (!userId) return res.status(400).json({ ok: false });
+  try {
+    const r = await pool.query('SELECT sparks, clicker_level FROM users WHERE id = $1', [userId]);
+    if (r.rows.length === 0) return res.status(404).json({ ok: false });
+    res.json({ ok: true, sparks: parseInt(r.rows[0].sparks || 0), level: r.rows[0].clicker_level || 1 });
+  } catch (err) {
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.post('/clicker-tap', async (req, res) => {
+  const { userId, taps } = req.body;
+  const uid = parseInt(userId);
+  const t = parseInt(taps) || 1;
+  if (!uid) return res.status(400).json({ ok: false });
+  try {
+    const r = await pool.query('SELECT clicker_level FROM users WHERE id = $1', [uid]);
+    if (r.rows.length === 0) return res.status(404).json({ ok: false });
+    const level = r.rows[0].clicker_level || 1;
+    const perTap = 1 + (level - 1) * 1;
+    const add = perTap * t;
+    await pool.query('UPDATE users SET sparks = sparks + $1 WHERE id = $2', [add, uid]);
+    const after = await pool.query('SELECT sparks FROM users WHERE id = $1', [uid]);
+    res.json({ ok: true, added: add, sparks: parseInt(after.rows[0].sparks || 0), perTap });
+  } catch (err) {
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.post('/exchange-sparks', async (req, res) => {
+  const { userId, sparks } = req.body;
+  const uid = parseInt(userId);
+  const s = parseInt(sparks) || 0;
+  if (!uid || s <= 0) return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  try {
+    const r = await pool.query('SELECT sparks FROM users WHERE id = $1', [uid]);
+    if (r.rows.length === 0) return res.status(404).json({ ok: false });
+    const have = parseInt(r.rows[0].sparks || 0);
+    if (have < s) return res.status(400).json({ ok: false, message: 'Мало искр' });
+    const coins = Math.floor(s / 100);
+    if (coins < 1) return res.status(400).json({ ok: false, message: 'Минимум 100 искр' });
+    const usedSparks = coins * 100;
+    await pool.query('UPDATE users SET sparks = sparks - $1, money = money + $2 WHERE id = $3', [usedSparks, coins, uid]);
+    const after = await pool.query('SELECT sparks, money FROM users WHERE id = $1', [uid]);
+    res.json({ ok: true, coins, sparks: parseInt(after.rows[0].sparks || 0), money: parseInt(after.rows[0].money || 0) });
+  } catch (err) {
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.post('/upgrade-clicker', async (req, res) => {
+  const { userId } = req.body;
+  const uid = parseInt(userId);
+  if (!uid) return res.status(400).json({ ok: false });
+  try {
+    const r = await pool.query('SELECT clicker_level, money FROM users WHERE id = $1', [uid]);
+    if (r.rows.length === 0) return res.status(404).json({ ok: false });
+    const level = r.rows[0].clicker_level || 1;
+    const cost = level * 10;
+    if ((r.rows[0].money || 0) < cost) return res.status(400).json({ ok: false, message: 'Мало монет', need: cost });
+    if (level >= 20) return res.status(400).json({ ok: false, message: 'Максимальный уровень' });
+    await pool.query('UPDATE users SET money = money - $1, clicker_level = clicker_level + 1 WHERE id = $2', [cost, uid]);
+    const after = await pool.query('SELECT money, clicker_level FROM users WHERE id = $1', [uid]);
+    res.json({ ok: true, money: parseInt(after.rows[0].money || 0), level: after.rows[0].clicker_level });
+  } catch (err) {
+    res.status(500).json({ ok: false });
   }
 });
 
