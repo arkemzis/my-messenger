@@ -1548,6 +1548,87 @@ app.post('/daily-bonus', async (req, res) => {
   }
 });
 
+// ============ ОТПРАВКА ПОДАРКА ============
+const GIFTS = {
+  'zaryad':   { name: 'Заряд',     emoji: '⚡',  price: 10 },
+  'plamya':   { name: 'Пламя',     emoji: '🔥',  price: 50 },
+  'yadro':    { name: 'Ядро',      emoji: '💠',  price: 100 },
+  'portal':   { name: 'Портал',    emoji: '🌌',  price: 500 },
+  'signal':   { name: 'Сигнал',    emoji: '🌠',  price: 1000 },
+  'korona':   { name: 'Корона',    emoji: '👑',  price: 5000 },
+  'pustota':  { name: 'Пустота',   emoji: '🕳️', price: 25000 },
+};
+
+app.get('/gifts-catalog', (req, res) => {
+  res.json({ ok: true, gifts: GIFTS });
+});
+
+app.post('/send-gift', async (req, res) => {
+  const { from, to, giftId, chatId, replyToId } = req.body;
+  const fromUserId = parseInt(from);
+  const toUserId = parseInt(to);
+  const cid = parseInt(chatId) || null;
+  const replyId = parseInt(replyToId) || null;
+  const gift = GIFTS[giftId];
+
+  if (!fromUserId || !toUserId || !gift) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+
+  try {
+    const fromRes = await pool.query('SELECT money, username, avatar_url FROM users WHERE id = $1', [fromUserId]);
+    if (fromRes.rows.length === 0) return res.status(404).json({ ok: false, message: 'Отправитель не найден' });
+    const fromUser = fromRes.rows[0];
+
+    if ((fromUser.money || 0) < gift.price) {
+      return res.status(400).json({ ok: false, message: 'Недостаточно монет', need: gift.price, have: fromUser.money || 0 });
+    }
+
+    await pool.query('UPDATE users SET money = money - $1 WHERE id = $2', [gift.price, fromUserId]);
+
+    const result = await pool.query(
+      `INSERT INTO messages
+         (from_user, to_user, chat_id, text, file_type, file_url, file_name, reply_to_id)
+       VALUES ($1, $2, $3, $4, 'gift', $5, $6, $7)
+       RETURNING id, created_at`,
+      [fromUserId, toUserId, cid, '', giftId, gift.name, replyId]
+    );
+
+    const msg = {
+      id: result.rows[0].id,
+      from: fromUserId,
+      to: toUserId,
+      chat_id: cid,
+      text: '',
+      file_type: 'gift',
+      file_url: giftId,
+      file_name: gift.name,
+      file_emoji: gift.emoji,
+      reply_to_id: replyId,
+      created_at: result.rows[0].created_at,
+    };
+
+    if (cid) {
+      const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [cid]);
+      for (const row of membersRes.rows) {
+        io.to('user_' + row.user_id).emit('message', msg);
+      }
+    } else {
+      io.to('user_' + fromUserId).emit('message', msg);
+      io.to('user_' + toUserId).emit('message', msg);
+    }
+
+    try {
+      await sendPushToUser(toUserId, `${fromUser.username || 'Друг'} дарит ${gift.emoji} ${gift.name}!`, 'Открой ARKZIS, чтобы увидеть подарок');
+    } catch(e) { console.error('push err', e); }
+
+    res.json({ ok: true, gift, messageId: result.rows[0].id });
+  } catch (err) {
+    console.error('send-gift error:', err);
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
 // ============ WebSocket ============
 io.on('connection', (socket) => {
   socket.on('identify', (userId) => {
