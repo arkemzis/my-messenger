@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const session = require('express-session');
@@ -1567,8 +1567,22 @@ app.post('/debug-add-money', async (req, res) => {
   res.json({ ok: true, money: r.rows[0]?.money });
 });
 
-app.get('/gifts-catalog', (req, res) => {
-  res.json({ ok: true, gifts: GIFTS });
+app.get('/gifts-catalog', async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT COUNT(*) AS cnt FROM messages WHERE file_type = 'gift' AND file_url = 'pustota'`);
+    const sold = parseInt(r.rows[0]?.cnt || 0);
+    const enriched = {};
+    for (const [k, v] of Object.entries(GIFTS)) {
+      enriched[k] = { ...v };
+      if (k === 'pustota') {
+        enriched[k].left = Math.max(0, 100 - sold);
+        enriched[k].total = 100;
+      }
+    }
+    res.json({ ok: true, gifts: enriched });
+  } catch (err) {
+    res.json({ ok: true, gifts: GIFTS });
+  }
 });
 
 app.post('/send-gift', async (req, res) => {
@@ -1581,6 +1595,14 @@ app.post('/send-gift', async (req, res) => {
 
   if (!fromUserId || !toUserId || !gift) {
     return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+
+  if (giftId === 'pustota') {
+    const cntRes = await pool.query(`SELECT COUNT(*) AS cnt FROM messages WHERE file_type = 'gift' AND file_url = 'pustota'`);
+    const sold = parseInt(cntRes.rows[0]?.cnt || 0);
+    if (sold >= 100) {
+      return res.status(400).json({ ok: false, message: 'Все 100 Пустот разобраны' });
+    }
   }
 
   try {
