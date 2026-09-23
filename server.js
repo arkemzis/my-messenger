@@ -63,6 +63,9 @@ async function initDatabase() {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(50) DEFAULT ''`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users (LOWER(username)) WHERE username <> ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS money INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_streak INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_claim TIMESTAMP`);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
@@ -1487,6 +1490,60 @@ app.delete('/stories/:id', async (req, res) => {
     io.emit('story_deleted', { id: storyId, user_id: userId });
     res.json({ ok: true });
   } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// ============ МОНЕТЫ И ПОДАРКИ ============
+app.get('/balance', async (req, res) => {
+  const userId = parseInt(req.query.userId) || req.session.userId;
+  if (!userId) return res.status(400).json({ ok: false, message: 'Нет userId' });
+  try {
+    const r = await pool.query('SELECT money, daily_streak, last_daily_claim FROM users WHERE id = $1', [userId]);
+    if (r.rows.length === 0) return res.status(404).json({ ok: false, message: 'Юзер не найден' });
+    res.json({ ok: true, ...r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+app.post('/daily-bonus', async (req, res) => {
+  const userId = parseInt(req.body.userId) || req.session.userId;
+  if (!userId) return res.status(400).json({ ok: false, message: 'Нет userId' });
+  try {
+    const r = await pool.query('SELECT money, daily_streak, last_daily_claim FROM users WHERE id = $1', [userId]);
+    if (r.rows.length === 0) return res.status(404).json({ ok: false, message: 'Юзер не найден' });
+
+    const now = new Date();
+    const last = r.rows[0].last_daily_claim;
+    let streak = r.rows[0].daily_streak || 0;
+
+    if (last) {
+      const hoursDiff = (now - new Date(last)) / 3600000;
+      if (hoursDiff < 20) {
+        return res.status(429).json({
+          ok: false,
+          message: 'Бонус уже получен. Попробуй позже',
+          nextIn: Math.ceil((20 - hoursDiff) * 60)
+        });
+      }
+      if (hoursDiff > 48) streak = 0;
+    }
+
+    streak += 1;
+    if (streak > 7) streak = 7;
+
+    const bonus = 100 + (streak - 1) * 50;
+    const newBalance = (r.rows[0].money || 0) + bonus;
+
+    await pool.query(
+      'UPDATE users SET money = $1, daily_streak = $2, last_daily_claim = $3 WHERE id = $4',
+      [newBalance, streak, now, userId]
+    );
+
+    res.json({ ok: true, bonus, streak, balance: newBalance });
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
