@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const session = require('express-session');
@@ -968,7 +968,7 @@ app.post('/call-accept', (req, res) => {
 });
 
 // ============ ВЕРСИЯ ПРИЛОЖЕНИЯ ============
-const LATEST_APP_VERSION = '0.3.0';  // ⚠️ меняй тут при каждом релизе!
+const LATEST_APP_VERSION = '0.4.0';  // ⚠️ меняй тут при каждом релизе!
 const LATEST_APK_URL = 'https://github.com/arkemzis/arkzis/releases/latest';
 
 app.get('/app-version', (req, res) => {
