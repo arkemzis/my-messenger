@@ -8,6 +8,37 @@ const { Server } = require('socket.io');
 const pool = require('./db');
 const Mailjet = require('node-mailjet');
 
+// ============ МИГРАЦИЯ: user_gifts ============
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_gifts (
+        id SERIAL PRIMARY KEY,
+        from_user INTEGER NOT NULL,
+        to_user INTEGER NOT NULL,
+        gift_id VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_gifts_to ON user_gifts(to_user)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_gifts_from ON user_gifts(from_user)`);
+    console.log('✅ user_gifts готова');
+
+    const cnt = await pool.query(`SELECT COUNT(*) AS c FROM user_gifts`);
+    if (parseInt(cnt.rows[0]?.c || 0) === 0) {
+      const res = await pool.query(`
+        INSERT INTO user_gifts (from_user, to_user, gift_id, created_at)
+        SELECT from_user, to_user, file_url, COALESCE(created_at, NOW())
+        FROM messages
+        WHERE file_type = 'gift' AND file_url IS NOT NULL
+      `);
+      console.log(`✅ Бэкфилл подарков: ${res.rowCount}`);
+    }
+  } catch (e) {
+    console.error('❌ migrate user_gifts:', e.message);
+  }
+})();
+
 // ============ EMAIL (Mailjet) ============
 let mailjet = null;
 try {
@@ -1646,17 +1677,17 @@ app.get('/my-gifts', async (req, res) => {
   if (!userId) return res.status(400).json({ ok: false });
   try {
     const received = await pool.query(
-      `SELECT file_url AS gift_id, COUNT(*) AS cnt
-       FROM messages
-       WHERE file_type = 'gift' AND to_user = $1
-       GROUP BY file_url`,
+      `SELECT gift_id, COUNT(*) AS cnt
+       FROM user_gifts
+       WHERE to_user = $1
+       GROUP BY gift_id`,
       [userId]
     );
     const sent = await pool.query(
-      `SELECT file_url AS gift_id, COUNT(*) AS cnt
-       FROM messages
-       WHERE file_type = 'gift' AND from_user = $1
-       GROUP BY file_url`,
+      `SELECT gift_id, COUNT(*) AS cnt
+       FROM user_gifts
+       WHERE from_user = $1
+       GROUP BY gift_id`,
       [userId]
     );
     const fmt = (rows) => {
@@ -1735,6 +1766,12 @@ app.post('/send-gift', async (req, res) => {
        VALUES ($1, $2, $3, $4, 'gift', $5, $6, $7)
        RETURNING id, created_at`,
       [fromUserId, toUserId, cid, '', giftId, gift.name, replyId]
+    );
+
+    // Дублируем в user_gifts — не пропадут при удалении чата
+    await pool.query(
+      `INSERT INTO user_gifts (from_user, to_user, gift_id) VALUES ($1, $2, $3)`,
+      [fromUserId, toUserId, giftId]
     );
 
     const msg = {
