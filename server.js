@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const session = require('express-session');
@@ -1805,6 +1805,63 @@ app.post('/send-gift', async (req, res) => {
     res.json({ ok: true, gift, messageId: result.rows[0].id });
   } catch (err) {
     console.error('send-gift error:', err);
+    res.status(500).json({ ok: false, message: 'Ошибка сервера' });
+  }
+});
+
+// ============ ARKZIS-EMOJI ============
+const ARKZIS_EMOJI_MAP = {
+  'heart': '💜', 'rocket': '🚀', 'spark': '⚡', 'gift': '🎁',
+  'crown': '👑', 'void': '🕳️', 'portal': '🌌', 'signal': '📡',
+};
+
+app.post('/send-arkzis-emoji', async (req, res) => {
+  const { from, to, chatId, emojiId, replyToId } = req.body;
+  const fromUserId = parseInt(from);
+  const toUserId = parseInt(to);
+  const cid = parseInt(chatId) || null;
+  const replyId = parseInt(replyToId) || null;
+  const id = String(emojiId || '').toLowerCase();
+
+  if (!fromUserId || !toUserId || !ARKZIS_EMOJI_MAP[id]) {
+    return res.status(400).json({ ok: false, message: 'Не хватает данных' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO messages
+         (from_user, to_user, chat_id, text, file_type, file_url, file_name, reply_to_id)
+       VALUES ($1, $2, $3, $4, 'arkzis_emoji', $5, $6, $7)
+       RETURNING id, created_at`,
+      [fromUserId, toUserId, cid, ARKZIS_EMOJI_MAP[id], id, id, replyId]
+    );
+
+    const msg = {
+      id: result.rows[0].id,
+      from: fromUserId,
+      to: toUserId,
+      chat_id: cid,
+      text: ARKZIS_EMOJI_MAP[id],
+      file_type: 'arkzis_emoji',
+      file_url: id,
+      file_name: id,
+      reply_to_id: replyId,
+      created_at: result.rows[0].created_at,
+    };
+
+    if (cid) {
+      const membersRes = await pool.query('SELECT user_id FROM chat_members WHERE chat_id = $1', [cid]);
+      for (const row of membersRes.rows) {
+        io.to('user_' + row.user_id).emit('message', msg);
+      }
+    } else {
+      io.to('user_' + fromUserId).emit('message', msg);
+      io.to('user_' + toUserId).emit('message', msg);
+    }
+
+    res.json({ ok: true, messageId: result.rows[0].id });
+  } catch (err) {
+    console.error('send-arkzis-emoji error:', err);
     res.status(500).json({ ok: false, message: 'Ошибка сервера' });
   }
 });
